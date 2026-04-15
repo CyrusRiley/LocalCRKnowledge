@@ -94,9 +94,35 @@ def extract_keywords(clean_text: str, *, limit: int = 12) -> list[str]:
         token = match.strip().lower()
         if token in STOPWORDS:
             continue
-        counts[token] = counts.get(token, 0) + 1
-    ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+        for candidate in _keyword_candidates(token):
+            if candidate in STOPWORDS:
+                continue
+            counts[candidate] = counts.get(candidate, 0) + 1
+    ranked = sorted(counts.items(), key=lambda item: (-item[1], -len(item[0]), item[0]))
     return [token for token, _ in ranked[:limit]]
+
+
+def _keyword_candidates(token: str) -> list[str]:
+    if not re.fullmatch(r"[\u4e00-\u9fff]+", token):
+        return [token]
+    if 2 <= len(token) <= 8:
+        return [token]
+    cleaned = re.sub(
+        r"(我之前|我以前|关于|有没有|有哪些|哪一些|哪些|什么|怎么|如何|是否|可以|用于|用来|内容|想法|意见|一个|以及|需要|进行)",
+        " ",
+        token,
+    )
+    candidates: list[str] = []
+    for run in re.split(r"\s+", cleaned):
+        if 2 <= len(run) <= 8:
+            candidates.append(run)
+        elif len(run) > 8:
+            for size in (6, 5, 4, 3, 2):
+                for start in range(0, len(run) - size + 1):
+                    piece = run[start : start + size]
+                    if not all(ch in "的是了和与有在中对及或" for ch in piece):
+                        candidates.append(piece)
+    return candidates or [token[:8]]
 
 
 def chunk_text(clean_text: str, *, chunk_size: int = 1800, chunk_overlap: int = 180) -> list[str]:

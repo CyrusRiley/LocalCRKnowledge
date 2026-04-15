@@ -13,10 +13,11 @@ from app.backend.llm.client import QwenClient
 from app.backend.llm.parser import parse_note_json, parse_section_markers_json
 from app.backend.keywords.normalizer import canonicalize_keywords
 from app.backend.maintenance.v2_backfill import backfill_v2_structures
-from app.backend.models import ChunkRecord, KnowledgeGroup, KnowledgeUnit, SourceRecord, StructuredNote
+from app.backend.models import ChunkRecord, KnowledgeGroup, KnowledgeUnit, SearchResult, SourceRecord, StructuredNote
 from app.backend.organizer.knowledge_organizer import organize_knowledge_base
 from app.backend.preprocess.cleaner import build_chunk_contexts, chunk_text, normalize_text, preprocess_text
 from app.backend.relations.relation_builder import build_structural_relations
+from app.backend.retrieval.answer_builder import build_answer_result
 from app.backend.retrieval.search_service import SearchService
 from app.backend.utils.logger import setup_logger
 from app.backend.utils.time_utils import utc_now_iso
@@ -109,6 +110,66 @@ class BackendTests(unittest.TestCase):
         repo.insert_note(note, [ChunkRecord("chunk-1", "note-1", "ABM 路径偏好", 0, "source", ["ABM"])])
         results = repo.search_notes("ABM", limit=5)
         self.assertEqual(results[0].title, "慢跑路径偏好")
+
+    def test_repository_chinese_sentence_search_uses_like_terms(self) -> None:
+        conn = memory_conn()
+        repo = KnowledgeRepository(conn)
+        source = _source("人行为模拟技术的发展经历了七次核心转向。")
+        source.clean_text = source.raw_text
+        repo.upsert_source(source)
+        note = StructuredNote(
+            note_id="note-chinese-search",
+            source_id=source.source_id,
+            title="行为模拟技术发展转向",
+            note_type="知识摘要",
+            themes=["行为模拟"],
+            summary="人行为模拟技术的发展经历了七次核心转向。",
+            key_points=["从结果拟合转向过程生成"],
+            usage_scenarios=[],
+            keywords=["行为模拟", "发展转向"],
+            source_excerpt=source.raw_text,
+            markdown_content="# 行为模拟技术发展转向\n\n人行为模拟技术的发展经历了七次核心转向。",
+            created_at=utc_now_iso(),
+            updated_at=utc_now_iso(),
+        )
+        repo.insert_note(note, [ChunkRecord("chunk-cn-search", note.note_id, note.summary, 0, "source_chunk", note.keywords)])
+        results = repo.search_notes("人行为模拟技术经历几次发展转向", limit=5)
+        self.assertEqual(results[0].note_id, "note-chinese-search")
+
+    def test_answer_builder_reports_extract_mode_without_results(self) -> None:
+        result = build_answer_result(
+            "没有命中的问题",
+            [],
+            llm_client=QwenClient("http://127.0.0.1:8080/v1", "qwen2.5", timeout_seconds=1),
+            logger=setup_logger(Path("data/logs"), name="answer_mode_test"),
+        )
+        self.assertEqual(result.mode, "extract")
+        self.assertIn("没有检索到", result.content)
+
+    def test_answer_builder_always_uses_extract_mode_with_results(self) -> None:
+        item = SearchResult(
+            note_id="note-answer-mode",
+            source_id="source-answer-mode",
+            title="ABM route preference",
+            note_type="summary",
+            summary="ABM can explain route preference.",
+            markdown_content="# ABM route preference\n\nABM can explain route preference.",
+            source_excerpt="ABM can explain route preference.",
+            themes=["ABM"],
+            keywords=["ABM"],
+            file_path=None,
+            imported_at=None,
+            score=1.0,
+            snippet="ABM can explain route preference.",
+        )
+        result = build_answer_result(
+            "What did I note about ABM?",
+            [item],
+            llm_client=QwenClient("http://127.0.0.1:1/v1", "unused", timeout_seconds=1),
+            logger=setup_logger(Path("data/logs"), name="answer_extract_mode_test"),
+        )
+        self.assertEqual(result.mode, "extract")
+        self.assertIn("ABM can explain route preference.", result.content)
 
     def test_repository_update_note_refreshes_fts(self) -> None:
         conn = memory_conn()

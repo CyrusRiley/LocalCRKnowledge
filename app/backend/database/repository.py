@@ -795,11 +795,19 @@ class KnowledgeRepository:
         theme: str | None = None,
         note_type: str | None = None,
     ) -> list[SearchResult]:
-        filters = [
-            "(n.title LIKE ? OR n.summary LIKE ? OR n.markdown_content LIKE ? OR n.source_excerpt LIKE ?)"
-        ]
-        like = f"%{query}%"
-        params: list[Any] = [like, like, like, like]
+        terms = _query_terms(query)
+        if not terms:
+            return []
+        text_filters: list[str] = []
+        params: list[Any] = []
+        for term in terms[:48]:
+            text_filters.append(
+                "(n.title LIKE ? OR n.summary LIKE ? OR n.markdown_content LIKE ? "
+                "OR n.source_excerpt LIKE ? OR n.themes_json LIKE ? OR n.keywords_json LIKE ?)"
+            )
+            like = f"%{term}%"
+            params.extend([like, like, like, like, like, like])
+        filters = [f"({' OR '.join(text_filters)})"]
         if theme:
             filters.append("n.themes_json LIKE ?")
             params.append(f"%{theme}%")
@@ -939,20 +947,75 @@ def _match_query(query: str) -> str:
 
 
 def _query_terms(query: str) -> list[str]:
-    tokens = re.findall(r"[\w\u4e00-\u9fff]+", query, flags=re.UNICODE)
+    tokens = re.findall(r"[A-Za-z][A-Za-z0-9_-]{1,}|[0-9]+|[\u4e00-\u9fff]+", query, flags=re.UNICODE)
     seen: set[str] = set()
     result: list[str] = []
     for token in tokens:
         token = token.strip()
         if not token:
             continue
-        if len(token) < 2 and not token.isascii():
-            continue
-        key = token.lower()
-        if key not in seen:
-            result.append(token)
+        candidates = [token] if not _contains_cjk(token) else _cjk_query_terms(token)
+        for candidate in candidates:
+            if len(candidate) < 2 and not candidate.isascii():
+                continue
+            key = candidate.lower()
+            if key not in seen:
+                result.append(candidate)
+                seen.add(key)
+    return result[:64]
+
+
+def _contains_cjk(value: str) -> bool:
+    return bool(re.search(r"[\u4e00-\u9fff]", value))
+
+
+def _cjk_query_terms(token: str) -> list[str]:
+    token = re.sub(
+        r"(我之前|我以前|以前|关于|有没有|有哪些|哪一些|哪些|什么|怎么|如何|是否|可以|用于|用来|内容|想法|意见|请|帮我|整理|一下)",
+        " ",
+        token,
+    )
+    runs = [part for part in re.split(r"\s+", token) if len(part) >= 2]
+    terms: list[str] = []
+    for run in runs:
+        if 2 <= len(run) <= 18:
+            terms.append(run)
+        max_n = min(6, len(run))
+        for size in range(max_n, 1, -1):
+            for start in range(0, len(run) - size + 1):
+                piece = run[start : start + size]
+                if _useful_cjk_piece(piece):
+                    terms.append(piece)
+    return _dedupe_terms(terms)[:48]
+
+
+def _useful_cjk_piece(piece: str) -> bool:
+    if len(piece) < 2:
+        return False
+    stop_pieces = {
+        "的",
+        "了",
+        "是",
+        "和",
+        "与",
+        "有",
+        "几次",
+        "几个",
+        "主要",
+        "阶段",
+    }
+    return piece not in stop_pieces and not all(ch in "的是了和与有在中对及或" for ch in piece)
+
+
+def _dedupe_terms(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        key = value.lower()
+        if value and key not in seen:
+            result.append(value)
             seen.add(key)
-    return result[:12]
+    return result
 
 
 def _normalize_keyword_name(value: str) -> str:

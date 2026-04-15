@@ -4,8 +4,25 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 
-data/db/*.sqlite3
-data/db/*.sqlite3-*
-data/exports/*.md
-data/logs/*.log
+# Local runtime data. These files can contain personal notes, paper excerpts,
+# local paths, logs, and generated answers.
+data/db/
+data/exports/
+data/imports/
+data/logs/
 data/test_tmp/
+
+# SQLite sidecar files.
+*.sqlite3-wal
+*.sqlite3-shm
+*.sqlite3-journal
+
+# Local-only configuration and secrets.
+.env
+.env.*
+*.local
+*.local.*
+
+# OS/editor noise.
+.DS_Store
+Thumbs.db

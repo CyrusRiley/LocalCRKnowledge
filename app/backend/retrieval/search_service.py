@@ -76,6 +76,8 @@ class SearchService:
             results = self.repo.search_notes(search_query, limit=limit, note_type=note_type)
         if not results:
             results = self._retry_terms(parsed.get("keywords") or [], limit=limit, note_type=note_type)
+            if not results and note_type:
+                results = self._retry_terms(parsed.get("keywords") or [], limit=limit, note_type=None)
             scores = {item.note_id: 0.3 for item in results}
         results = self._expand_context(results, limit=limit * 2)
         results = self._rerank(results, scores=scores, query_terms=expanded_terms or parsed_keywords or [question], limit=limit)

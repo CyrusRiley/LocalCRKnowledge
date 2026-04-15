@@ -22,7 +22,7 @@ from app.backend.keywords.normalizer import canonicalize_keywords
 from app.backend.llm.client import QwenClient
 from app.backend.maintenance.v2_backfill import backfill_v2_structures
 from app.backend.organizer.knowledge_organizer import organize_knowledge_base
-from app.backend.retrieval.answer_builder import build_answer
+from app.backend.retrieval.answer_builder import build_answer_result
 from app.backend.retrieval.search_service import SearchService
 from app.backend.updater.incremental_updater import IncrementalUpdater
 from app.backend.utils.logger import setup_logger
@@ -355,7 +355,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                 try:
                     service = SearchService(ctx.repo, ctx.llm_client, ctx.logger)
                     parsed_question, results = service.question_search(question, limit=limit)
-                    answer = build_answer(question, results, llm_client=ctx.llm_client, logger=ctx.logger)
+                    answer_result = build_answer_result(question, results, llm_client=ctx.llm_client, logger=ctx.logger)
+                    answer = answer_result.content
                     exported_path = None
                     if should_export:
                         exported_path = str(
@@ -372,6 +373,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                             "parsed_question": parsed_question,
                             "results": [_result_dict(item) for item in results],
                             "answer": answer,
+                            "answer_mode": answer_result.mode,
                             "exported_path": exported_path,
                         },
                     )

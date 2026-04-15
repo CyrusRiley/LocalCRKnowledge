@@ -28,6 +28,7 @@ const els = {
   keywordQuery: document.getElementById("keyword-query"),
   questionQuery: document.getElementById("question-query"),
   searchResultList: document.getElementById("search-result-list"),
+  answerModeBadge: document.getElementById("answer-mode-badge"),
   answerView: document.getElementById("answer-view"),
 };
 
@@ -357,15 +358,18 @@ async function keywordSearch() {
   const query = els.keywordQuery.value.trim();
   if (!query) {
     els.answerView.textContent = "请输入关键词。";
+    setAnswerMode("");
     return;
   }
   els.answerView.textContent = "正在检索...";
+  setAnswerMode("");
   try {
     const data = await apiGet(`/api/search?query=${encodeURIComponent(query)}&limit=12`);
     renderSearchResults(data.results || []);
     els.answerView.textContent = `命中 ${data.results.length} 条。`;
   } catch (err) {
     els.answerView.textContent = `检索失败：${err.message}`;
+    setAnswerMode("");
   }
 }
 
@@ -373,9 +377,11 @@ async function askQuestion() {
   const question = els.questionQuery.value.trim();
   if (!question) {
     els.answerView.textContent = "请输入问题。";
+    setAnswerMode("");
     return;
   }
   els.answerView.textContent = "正在生成结构化回答...";
+  setAnswerMode("");
   try {
     const data = await apiPost("/api/ask", {
       question,
@@ -384,11 +390,25 @@ async function askQuestion() {
     });
     renderSearchResults(data.results || []);
     state.latestAnswer = data.answer || "";
+    setAnswerMode(data.answer_mode || "extract");
     els.answerView.innerHTML = markdownToHtml(state.latestAnswer, { hideSourceInfo: false, removeEmptySections: false });
     switchTab("qa");
   } catch (err) {
     els.answerView.textContent = `问答失败：${err.message}`;
+    setAnswerMode("");
   }
+}
+
+function setAnswerMode(mode) {
+  if (!els.answerModeBadge) return;
+  if (!mode) {
+    els.answerModeBadge.className = "mode-badge hidden";
+    els.answerModeBadge.textContent = "";
+    return;
+  }
+  const normalized = mode === "model" ? "model" : "extract";
+  els.answerModeBadge.textContent = normalized === "model" ? "模型" : "摘录";
+  els.answerModeBadge.className = `mode-badge mode-${normalized}`;
 }
 
 async function exportCurrentMarkdown() {

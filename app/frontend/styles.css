@@ -117,6 +117,30 @@ main {
   font-size: 13px;
 }
 
+.mode-badge {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 5px 10px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.mode-badge.hidden {
+  display: none;
+}
+
+.mode-model {
+  background: #e3f2ec;
+  border-color: #9bcbbd;
+  color: #185443;
+}
+
+.mode-extract {
+  background: #f7f3e8;
+  border-color: #dbc99b;
+  color: #66521b;
+}
+
 button,
 input,
 select,

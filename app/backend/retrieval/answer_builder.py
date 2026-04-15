@@ -1,10 +1,16 @@
 from __future__ import annotations
 
-import os
+from dataclasses import dataclass
 from logging import Logger
 
-from app.backend.llm.client import LLMError, QwenClient
+from app.backend.llm.client import QwenClient
 from app.backend.models import SearchResult
+
+
+@dataclass(frozen=True)
+class AnswerBuildResult:
+    content: str
+    mode: str
 
 
 def build_answer(
@@ -14,8 +20,24 @@ def build_answer(
     llm_client: QwenClient,
     logger: Logger,
 ) -> str:
+    return build_answer_result(question, results, llm_client=llm_client, logger=logger).content
+
+
+def build_answer_result(
+    question: str,
+    results: list[SearchResult],
+    *,
+    llm_client: QwenClient,
+    logger: Logger,
+) -> AnswerBuildResult:
+    # The local model's synthesized answers are often less faithful than direct
+    # extractive summaries for this note-taking workflow, so answers always use
+    # the stable extract mode. The llm_client/logger parameters stay in the
+    # signature to keep the API boundary compatible with earlier callers.
+    _ = (llm_client, logger)
     if not results:
-        return f"""# 回答主题
+        return AnswerBuildResult(
+            content=f"""# 回答主题
 
 ## 相关结论
 知识库中没有检索到足够相关的内容。
@@ -31,22 +53,25 @@ def build_answer(
 
 ## 相关来源
 （空）
-"""
+""",
+            mode="extract",
+        )
 
-    if os.getenv("LK_DISABLE_LLM", "").lower() in {"1", "true", "yes"}:
-        return fallback_answer(question, results)
-
-    context = build_context(results)
-    try:
-        return llm_client.build_answer(question, context)
-    except LLMError as exc:
-        logger.error("Answer generation failed, falling back to extractive answer: %s", exc)
-        return fallback_answer(question, results)
+    return AnswerBuildResult(content=fallback_answer(question, results), mode="extract")
 
 
-def build_context(results: list[SearchResult]) -> str:
+def build_context(
+    results: list[SearchResult],
+    *,
+    max_items: int = 8,
+    markdown_chars: int = 0,
+    total_chars: int = 3200,
+) -> str:
     blocks = []
-    for index, item in enumerate(results, start=1):
+    used_chars = 0
+    for index, item in enumerate(results[:max_items], start=1):
+        markdown = (item.markdown_content or "")[:markdown_chars] if markdown_chars > 0 else ""
+        markdown_block = f"\nMarkdown：\n{markdown}\n" if markdown else ""
         blocks.append(
             f"""## 条目 {index}: {item.title}
 - note_id: {item.note_id}
@@ -62,11 +87,11 @@ def build_context(results: list[SearchResult]) -> str:
 
 匹配片段：
 {item.snippet}
-
-Markdown：
-{item.markdown_content[:2000]}
-"""
+{markdown_block}"""
         )
+        used_chars += len(blocks[-1])
+        if used_chars >= total_chars:
+            break
     return "\n\n".join(blocks)
 
 
