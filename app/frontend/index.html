@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>LocalKnowledge Workbench</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=Noto+Sans+SC:wght@400;500;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <header class="top-strip">
+      <div class="brand">
+        <h1>LocalKnowledge Workbench</h1>
+        <p>导入 · 整理 · 入库 · 检索 · 问答</p>
+      </div>
+      <img
+        src="https://images.unsplash.com/photo-1454165804606-c3d57bc86b40?auto=format&fit=crop&w=900&q=80"
+        alt="desk"
+      />
+    </header>
+
+    <nav class="tabs">
+      <button class="tab-button active" data-tab="import">导入与整理</button>
+      <button class="tab-button" data-tab="result">结构化结果</button>
+      <button class="tab-button" data-tab="library">知识库</button>
+      <button class="tab-button" data-tab="qa">检索问答</button>
+    </nav>
+
+    <main>
+      <section class="tab-panel active" id="tab-import">
+        <div class="panel-title">
+          <h2>导入与整理</h2>
+          <span id="health-badge">连接检查中</span>
+        </div>
+        <div class="form-grid">
+          <div class="import-row">
+            <label for="direction-select">整理方向</label>
+            <select id="direction-select">
+              <option value="提炼为科研灵感条目">提炼为科研灵感条目</option>
+              <option value="提炼为论文修改意见">提炼为论文修改意见</option>
+              <option value="提炼为可用于写作的知识摘要" selected>提炼为可用于写作的知识摘要</option>
+              <option value="提炼为主题归纳条目">提炼为主题归纳条目</option>
+            </select>
+            <button id="btn-import-text" class="primary">整理入库</button>
+          </div>
+
+          <div class="import-row import-row-textarea">
+            <label for="raw-text">粘贴原始文本</label>
+            <textarea id="raw-text" rows="8" placeholder="把临时笔记、修改意见、摘录粘贴到这里"></textarea>
+            <span class="row-spacer"></span>
+          </div>
+
+          <div class="import-row">
+            <label for="file-input">上传 txt/md 文件</label>
+            <input id="file-input" type="file" accept=".txt,.md" multiple />
+            <button id="btn-import-files">批量导入</button>
+          </div>
+
+          <div class="import-row">
+            <label for="file-path">导入本地单文件路径</label>
+            <input id="file-path" type="text" placeholder="例如：G:\notes\draft.md" />
+            <button id="btn-import-file-path">导入文件</button>
+          </div>
+
+          <div class="import-row">
+            <label for="dir-path">增量扫描目录路径</label>
+            <input id="dir-path" type="text" placeholder="例如：G:\notes\research" />
+            <button id="btn-import-dir">增量更新</button>
+          </div>
+        </div>
+        <pre id="import-log" class="log-box"></pre>
+      </section>
+
+      <section class="tab-panel" id="tab-result">
+        <div class="panel-title">
+          <h2>结构化结果</h2>
+          <button id="btn-export-current">导出当前 Markdown</button>
+        </div>
+        <div class="result-grid">
+          <div>
+            <h3>原始文本</h3>
+            <textarea id="result-raw" rows="16"></textarea>
+          </div>
+          <div>
+            <h3>渲染预览</h3>
+            <div id="markdown-preview" class="preview"></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="tab-panel" id="tab-library">
+        <div class="panel-title">
+          <h2>知识库</h2>
+          <div class="panel-actions">
+            <button id="btn-organize-library" class="primary">整理知识库</button>
+            <img
+              class="panel-image"
+              src="https://images.unsplash.com/photo-1456324504439-367cee3b3c32?auto=format&fit=crop&w=900&q=80"
+              alt="library"
+            />
+          </div>
+        </div>
+        <div id="organize-status" class="organize-status">尚未运行知识库整理任务。</div>
+        <div class="filter-row">
+          <input id="filter-theme" type="text" placeholder="主题筛选（可空）" />
+          <input id="filter-type" type="text" placeholder="类型筛选（可空）" />
+          <input id="filter-limit" type="number" min="1" max="200" value="30" />
+          <button id="btn-refresh-notes">刷新列表</button>
+        </div>
+        <div class="library-grid">
+          <ul id="note-list" class="note-list"></ul>
+          <section class="note-editor">
+            <div class="editor-actions">
+              <button id="btn-save-note" class="primary">保存当前条目</button>
+              <button id="btn-reset-note">重置为数据库内容</button>
+            </div>
+            <div class="editor-grid">
+              <label for="edit-title">标题</label>
+              <input id="edit-title" type="text" />
+
+              <label for="edit-note-type">内容类型</label>
+              <input id="edit-note-type" type="text" />
+
+              <label for="edit-themes">核心主题（逗号分隔）</label>
+              <input id="edit-themes" type="text" />
+
+              <label for="edit-keywords">关键词（逗号分隔）</label>
+              <input id="edit-keywords" type="text" />
+
+              <label for="edit-summary">摘要</label>
+              <textarea id="edit-summary" rows="3"></textarea>
+
+              <label for="edit-key-points">关键要点（每行一条）</label>
+              <textarea id="edit-key-points" rows="4"></textarea>
+
+              <label for="edit-usage-scenarios">可用场景（每行一条）</label>
+              <textarea id="edit-usage-scenarios" rows="3"></textarea>
+
+              <label for="edit-user-insights">进一步想法</label>
+              <textarea id="edit-user-insights" rows="3"></textarea>
+
+              <label for="edit-source-excerpt">来源摘录</label>
+              <textarea id="edit-source-excerpt" rows="3"></textarea>
+            </div>
+            <h3>条目预览</h3>
+            <article id="note-detail" class="note-detail">点击左侧条目查看详情并编辑</article>
+          </section>
+        </div>
+      </section>
+
+      <section class="tab-panel" id="tab-qa">
+        <div class="panel-title">
+          <h2>检索问答</h2>
+          <img
+            class="panel-image"
+            src="https://images.unsplash.com/photo-1455390582262-044cdead277a?auto=format&fit=crop&w=900&q=80"
+            alt="analysis"
+          />
+        </div>
+        <div class="qa-grid">
+          <label for="keyword-query">关键词检索</label>
+          <input id="keyword-query" type="text" placeholder="例如：ABM 路径偏好" />
+          <button id="btn-keyword-search">搜索关键词</button>
+
+          <label for="question-query">问题检索与回答</label>
+          <textarea id="question-query" rows="3" placeholder="例如：我之前关于慢跑路径偏好的想法有哪些？"></textarea>
+          <button id="btn-ask">生成结构化回答</button>
+        </div>
+        <div class="library-grid">
+          <ul id="search-result-list" class="note-list"></ul>
+          <article id="answer-view" class="note-detail">检索结果和回答会显示在这里</article>
+        </div>
+      </section>
+    </main>
+
+    <script src="./app.js"></script>
+  </body>
+</html>

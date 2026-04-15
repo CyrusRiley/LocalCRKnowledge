@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*.pyc.*
+.pytest_cache/
+.mypy_cache/
+
+data/db/*.sqlite3
+data/db/*.sqlite3-*
+data/exports/*.md
+data/logs/*.log
+data/test_tmp/
