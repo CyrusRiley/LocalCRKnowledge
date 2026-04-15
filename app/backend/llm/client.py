@@ -6,7 +6,7 @@ import urllib.request
 from dataclasses import dataclass
 
 from app.backend.llm import prompts
-from app.backend.llm.parser import parse_note_json, parse_question_json
+from app.backend.llm.parser import parse_note_json, parse_question_json, parse_section_markers_json
 
 
 class LLMError(RuntimeError):
@@ -49,6 +49,10 @@ class QwenClient:
     def parse_question(self, question: str) -> dict:
         content = self.chat(prompts.question_parse_prompt(question), temperature=0.1)
         return parse_question_json(content, question)
+
+    def detect_structure(self, clean_text: str, *, max_units: int = 16) -> list[dict[str, str]]:
+        content = self.chat(prompts.structure_detect_prompt(clean_text, max_units=max_units), temperature=0.0)
+        return parse_section_markers_json(content)
 
     def build_answer(self, question: str, context_markdown: str) -> str:
         return self.chat(prompts.answer_prompt(question, context_markdown), temperature=0.2)

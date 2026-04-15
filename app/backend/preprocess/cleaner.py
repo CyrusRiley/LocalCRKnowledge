@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from app.backend.analysis.document_analyzer import split_text_into_units
 from app.backend.models import PreprocessResult
 
 
@@ -63,9 +64,27 @@ def normalize_text(raw_text: str) -> str:
 
 def infer_title(clean_text: str, *, max_length: int = 48) -> str:
     for line in clean_text.splitlines():
-        line = line.strip("#- 　\t")
-        if line:
-            return line[:max_length]
+        stripped = line.strip()
+        if not stripped:
+            continue
+        markdown = re.match(r"^#{1,6}\s+(.+)$", stripped)
+        if markdown:
+            return markdown.group(1).strip()[:max_length]
+        numbered = re.match(
+            r"^(?:第[一二三四五六七八九十百]+[章节部分点]|[一二三四五六七八九十百]+[、.．]|[（(]?[0-9]+[）).、])\s*(.+)$",
+            stripped,
+        )
+        if numbered and len(stripped) <= max_length + 16:
+            return (numbered.group(1).strip() or stripped)[:max_length]
+
+    keywords = extract_keywords(clean_text, limit=3)
+    if keywords:
+        return " / ".join(keywords)[:max_length]
+    for line in clean_text.splitlines():
+        cleaned = line.strip("#- 　\t")
+        if cleaned:
+            topic = re.split(r"[。！？!?；;，,]", cleaned, maxsplit=1)[0].strip()
+            return (topic or cleaned)[:max_length]
     return "未命名条目"
 
 
@@ -81,36 +100,7 @@ def extract_keywords(clean_text: str, *, limit: int = 12) -> list[str]:
 
 
 def chunk_text(clean_text: str, *, chunk_size: int = 1800, chunk_overlap: int = 180) -> list[str]:
-    if not clean_text:
-        return []
-    if len(clean_text) <= chunk_size:
-        return [clean_text]
-
-    paragraphs = [part.strip() for part in clean_text.split("\n\n") if part.strip()]
-    chunks: list[str] = []
-    current: list[str] = []
-    current_len = 0
-
-    for paragraph in paragraphs:
-        units = [paragraph] if len(paragraph) <= chunk_size else _split_long_paragraph(paragraph, chunk_size)
-        for unit in units:
-            unit_len = len(unit)
-            if current and current_len + 2 + unit_len > chunk_size:
-                chunks.append("\n\n".join(current).strip())
-                current = [unit]
-                current_len = unit_len
-            else:
-                if current:
-                    current_len += 2 + unit_len
-                else:
-                    current_len = unit_len
-                current.append(unit)
-
-    if current:
-        chunks.append("\n\n".join(current).strip())
-
-    merged = _merge_tiny_chunks(chunks, min_chunk_size=max(80, chunk_size // 4))
-    return _apply_overlap(merged, overlap=max(0, min(chunk_overlap, chunk_size // 4)))
+    return split_text_into_units(clean_text, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
 
 
 def build_chunk_contexts(chunks: list[str], *, context_chars: int = 260) -> list[ChunkContext]:

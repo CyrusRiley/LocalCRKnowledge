@@ -14,6 +14,33 @@ NOTE_JSON_FIELDS = """{
 }"""
 
 
+def structure_detect_prompt(clean_text: str, *, max_units: int = 16) -> list[dict[str, str]]:
+    system = (
+        "你是科研笔记的结构识别器。你的任务不是总结，也不是改写，"
+        "只识别原文中相对完整的主题单元边界，并返回 JSON 数组。"
+    )
+    user = f"""
+请识别下面文本中可以拆成知识条目的主题单元。
+
+输出要求：
+1. 只能返回 JSON 数组，不要 Markdown，不要解释。
+2. 最多返回 {max_units} 个单元。
+3. 每个元素必须包含 title、start_quote、end_quote、reason。
+4. title 是主题短语，不要直接照抄第一句话，长度建议 6-24 个汉字。
+5. start_quote 和 end_quote 必须是原文中真实连续出现的短摘录，用于程序定位边界。
+6. 如果原文有“七个要点/若干阶段/多个小标题”，应按这些要点或小标题拆分。
+
+JSON 示例：
+[
+  {{"title": "研究问题定位", "start_quote": "原文开头短摘录", "end_quote": "原文结尾短摘录", "reason": "该段集中讨论一个问题"}}
+]
+
+原文：
+{clean_text}
+""".strip()
+    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
 def organize_prompt(
     clean_text: str,
     direction: str,
@@ -26,7 +53,7 @@ def organize_prompt(
     chunk_count: int | None = None,
 ) -> list[dict[str, str]]:
     system = (
-        "你是一个本地科研笔记整理器。只把用户给出的原文整理成稳定 JSON，"
+        "你是一个本地科研笔记整理器。只把用户给出的当前知识单元整理成稳定 JSON，"
         "不要编造来源，不要输出 Markdown，不要输出解释。"
     )
     chunk_meta = ""
@@ -52,7 +79,10 @@ def organize_prompt(
 2. 字段必须完整，字段名必须与模板一致。
 3. themes、key_points、usage_scenarios、keywords 必须是字符串数组。
 4. source_excerpt 必须来自“当前片段原文”，长度控制在 300 字以内。
-5. 不确定的字段用空字符串或空数组，不要编造。
+5. title 必须是本知识单元的主题短语，不能直接使用第一句话；建议 6-24 个汉字。
+6. keywords 优先使用简短、稳定、上位的概念词，例如“行为模拟”优先于“行为模拟技术”。
+7. key_points 要合并相近表述，避免把同义句拆成重复要点。
+8. 不确定的字段用空字符串或空数组，不要编造。
 
 JSON 模板：
 {NOTE_JSON_FIELDS}

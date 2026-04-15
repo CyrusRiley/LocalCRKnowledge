@@ -1,11 +1,11 @@
 const state = {
-  selectedNoteId: "",
-  selectedNote: null,
   currentRawText: "",
   currentMarkdown: "",
   latestAnswer: "",
   organizeRunId: "",
   organizePollTimer: null,
+  notes: [],
+  relations: [],
 };
 
 const els = {
@@ -20,21 +20,11 @@ const els = {
   dirPath: document.getElementById("dir-path"),
   resultRaw: document.getElementById("result-raw"),
   markdownPreview: document.getElementById("markdown-preview"),
-  filterTheme: document.getElementById("filter-theme"),
-  filterType: document.getElementById("filter-type"),
-  filterLimit: document.getElementById("filter-limit"),
   organizeStatus: document.getElementById("organize-status"),
-  noteList: document.getElementById("note-list"),
-  noteDetail: document.getElementById("note-detail"),
-  editTitle: document.getElementById("edit-title"),
-  editNoteType: document.getElementById("edit-note-type"),
-  editThemes: document.getElementById("edit-themes"),
-  editKeywords: document.getElementById("edit-keywords"),
-  editSummary: document.getElementById("edit-summary"),
-  editKeyPoints: document.getElementById("edit-key-points"),
-  editUsageScenarios: document.getElementById("edit-usage-scenarios"),
-  editUserInsights: document.getElementById("edit-user-insights"),
-  editSourceExcerpt: document.getElementById("edit-source-excerpt"),
+  networkLimit: document.getElementById("network-limit"),
+  networkSummary: document.getElementById("network-summary"),
+  graph: document.getElementById("knowledge-graph"),
+  relationList: document.getElementById("relation-list"),
   keywordQuery: document.getElementById("keyword-query"),
   questionQuery: document.getElementById("question-query"),
   searchResultList: document.getElementById("search-result-list"),
@@ -46,7 +36,7 @@ init();
 function init() {
   bindEvents();
   refreshHealth();
-  refreshNotes();
+  refreshNetwork();
   loadLatestOrganizeRun();
 }
 
@@ -59,32 +49,11 @@ function bindEvents() {
   document.getElementById("btn-import-files").addEventListener("click", importFiles);
   document.getElementById("btn-import-file-path").addEventListener("click", importFileByPath);
   document.getElementById("btn-import-dir").addEventListener("click", importDirectory);
-  document.getElementById("btn-refresh-notes").addEventListener("click", refreshNotes);
+  document.getElementById("btn-refresh-network").addEventListener("click", refreshNetwork);
   document.getElementById("btn-organize-library").addEventListener("click", startOrganizeLibrary);
   document.getElementById("btn-keyword-search").addEventListener("click", keywordSearch);
   document.getElementById("btn-ask").addEventListener("click", askQuestion);
   document.getElementById("btn-export-current").addEventListener("click", exportCurrentMarkdown);
-  document.getElementById("btn-save-note").addEventListener("click", saveSelectedNote);
-  document.getElementById("btn-reset-note").addEventListener("click", resetSelectedNoteEditor);
-
-  [
-    els.editTitle,
-    els.editNoteType,
-    els.editThemes,
-    els.editKeywords,
-    els.editSummary,
-    els.editKeyPoints,
-    els.editUsageScenarios,
-    els.editUserInsights,
-    els.editSourceExcerpt,
-  ].forEach((field) => {
-    field.addEventListener("input", () => {
-      const markdown = buildMarkdownFromEditor();
-      state.currentMarkdown = markdown;
-      els.noteDetail.innerHTML = markdownToHtml(markdown, { hideSourceInfo: true, removeEmptySections: true });
-      renderPreview(markdown);
-    });
-  });
 }
 
 async function loadLatestOrganizeRun() {
@@ -146,7 +115,7 @@ async function importText() {
       updateResultView(text, data.markdown);
       switchTab("result");
     }
-    refreshNotes();
+    refreshNetwork();
   } catch (err) {
     appendImportLog(`整理失败：${err.message}`);
   }
@@ -176,7 +145,7 @@ async function importFiles() {
       updateResultView("", lastSuccess.markdown);
       switchTab("result");
     }
-    refreshNotes();
+    refreshNetwork();
   } catch (err) {
     appendImportLog(`文件导入失败：${err.message}`);
   }
@@ -200,7 +169,7 @@ async function importFileByPath() {
       updateResultView("", data.markdown);
       switchTab("result");
     }
-    refreshNotes();
+    refreshNetwork();
   } catch (err) {
     appendImportLog(`路径导入失败：${err.message}`);
   }
@@ -220,7 +189,7 @@ async function importDirectory() {
       recursive: true,
     });
     appendImportLog(JSON.stringify(data, null, 2));
-    refreshNotes();
+    refreshNetwork();
   } catch (err) {
     appendImportLog(`目录增量失败：${err.message}`);
   }
@@ -256,7 +225,7 @@ function startOrganizePolling() {
         clearInterval(state.organizePollTimer);
         state.organizePollTimer = null;
         await loadLatestOrganizeRun();
-        await refreshNotes();
+        await refreshNetwork();
       }
     } catch (err) {
       els.organizeStatus.textContent = `整理状态轮询失败：${err.message}`;
@@ -266,97 +235,122 @@ function startOrganizePolling() {
   }, 2500);
 }
 
-async function refreshNotes() {
-  const params = new URLSearchParams();
-  params.set("limit", `${Math.max(1, Number(els.filterLimit.value || "30"))}`);
-  if (els.filterTheme.value.trim()) {
-    params.set("theme", els.filterTheme.value.trim());
-  }
-  if (els.filterType.value.trim()) {
-    params.set("note_type", els.filterType.value.trim());
-  }
+async function refreshNetwork() {
+  const limit = Math.max(10, Math.min(200, Number(els.networkLimit.value || "80")));
   try {
-    const data = await apiGet(`/api/notes?${params.toString()}`);
-    renderNoteList(data.notes || []);
+    const [notesData, organizeData] = await Promise.all([
+      apiGet(`/api/notes?limit=${limit}`),
+      apiGet("/api/library/organize/latest"),
+    ]);
+    state.notes = notesData.notes || [];
+    state.relations = organizeData.relations || [];
+    renderKnowledgeNetwork(state.notes, state.relations, organizeData.run || null);
   } catch (err) {
-    els.noteList.innerHTML = `<li class="note-item">加载失败：${escapeHtml(err.message)}</li>`;
+    els.networkSummary.textContent = `网络加载失败：${err.message}`;
+    els.graph.innerHTML = "";
+    els.relationList.innerHTML = "";
   }
 }
 
-function renderNoteList(notes) {
-  if (!notes.length) {
-    els.noteList.innerHTML = `<li class="note-item">暂无条目。</li>`;
-    clearNoteEditor();
-    els.noteDetail.textContent = "点击左侧条目查看详情并编辑";
-    return;
-  }
-  const html = notes
-    .map(
-      (note) => `
-      <li class="note-item" data-note-id="${escapeAttr(note.note_id)}">
-        <strong>${escapeHtml(note.title || "未命名")}</strong>
-        <small>${escapeHtml(note.note_type || "未分类")} · ${escapeHtml(note.updated_at || "")}</small>
-      </li>
-    `,
-    )
+function renderKnowledgeNetwork(notes, relations, run) {
+  const noteMap = new Map(notes.map((note) => [note.note_id, note]));
+  const relationNodes = new Set();
+  relations.forEach((rel) => {
+    relationNodes.add(rel.from_note_id);
+    relationNodes.add(rel.to_note_id);
+  });
+  const nodes = notes
+    .filter((note) => relationNodes.size === 0 || relationNodes.has(note.note_id))
+    .slice(0, 48);
+  const visible = new Set(nodes.map((note) => note.note_id));
+  const edges = relations
+    .filter((rel) => visible.has(rel.from_note_id) && visible.has(rel.to_note_id))
+    .slice(0, 140);
+
+  const stats = run && run.stats ? run.stats : {};
+  els.networkSummary.innerHTML = [
+    `<strong>${nodes.length}</strong> 个节点`,
+    `<strong>${edges.length}</strong> 条关系`,
+    stats.duplicate_candidates !== undefined ? `<strong>${stats.duplicate_candidates}</strong> 个重复候选` : "",
+    run ? `最近整理：${escapeHtml(run.status || "unknown")}` : "尚未整理",
+  ]
+    .filter(Boolean)
+    .map((item) => `<span>${item}</span>`)
     .join("");
-  els.noteList.innerHTML = html;
-  els.noteList.querySelectorAll(".note-item").forEach((item) => {
-    item.addEventListener("click", () => loadNoteDetail(item.dataset.noteId));
-  });
+
+  renderGraph(nodes, edges, noteMap);
+  renderRelationList(edges, noteMap);
 }
 
-async function loadNoteDetail(noteId) {
-  if (!noteId) return;
-  state.selectedNoteId = noteId;
-  try {
-    const data = await apiGet(`/api/notes/${encodeURIComponent(noteId)}`);
-    const note = data.note;
-    state.selectedNote = note;
-    populateNoteEditor(note);
-    els.noteDetail.innerHTML = markdownToHtml(note.markdown_content || "", {
-      hideSourceInfo: true,
-      removeEmptySections: true,
-    });
-    updateResultView("", note.markdown_content || "");
-  } catch (err) {
-    els.noteDetail.textContent = `加载失败：${err.message}`;
-  }
-}
-
-async function saveSelectedNote() {
-  if (!state.selectedNoteId) {
-    alert("请先从左侧列表选择一条知识。");
+function renderGraph(nodes, edges, noteMap) {
+  if (!nodes.length) {
+    els.graph.innerHTML = `<text x="36" y="60" class="graph-empty">暂无网络。导入内容后点击“整理知识库”。</text>`;
     return;
   }
-  try {
-    const payload = collectEditorPayload();
-    const data = await apiPost("/api/notes/update", payload);
-    const note = data.note;
-    state.selectedNote = note;
-    state.currentMarkdown = note.markdown_content || "";
-    els.noteDetail.innerHTML = markdownToHtml(note.markdown_content || "", {
-      hideSourceInfo: true,
-      removeEmptySections: true,
+
+  const width = 900;
+  const height = 520;
+  const cx = width / 2;
+  const cy = height / 2;
+  const radius = Math.min(width, height) * 0.34;
+  const positions = new Map();
+
+  nodes.forEach((node, index) => {
+    const angle = (Math.PI * 2 * index) / nodes.length - Math.PI / 2;
+    positions.set(node.note_id, {
+      x: cx + Math.cos(angle) * radius,
+      y: cy + Math.sin(angle) * radius,
     });
-    renderPreview(state.currentMarkdown);
-    refreshNotes();
-    alert("保存成功。");
-  } catch (err) {
-    alert(`保存失败：${err.message}`);
-  }
+  });
+
+  const edgeHtml = edges
+    .map((edge) => {
+      const a = positions.get(edge.from_note_id);
+      const b = positions.get(edge.to_note_id);
+      if (!a || !b) return "";
+      return `<line class="edge edge-${escapeAttr(edge.relation_type || "related")}" x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}"><title>${escapeHtml(edge.relation_type || "")}</title></line>`;
+    })
+    .join("");
+
+  const nodeHtml = nodes
+    .map((node) => {
+      const pos = positions.get(node.note_id);
+      const title = compactTitle(node.title || "未命名", 12);
+      return `
+        <g class="graph-node">
+          <circle cx="${pos.x}" cy="${pos.y}" r="20"></circle>
+          <text x="${pos.x}" y="${pos.y + 36}" text-anchor="middle">${escapeHtml(title)}</text>
+          <title>${escapeHtml(node.title || "未命名")}</title>
+        </g>`;
+    })
+    .join("");
+
+  const legend = `
+    <g class="graph-legend">
+      <text x="24" y="32">same_group / sequence_next / shared_keyword / duplicate_of / related_to</text>
+    </g>`;
+
+  els.graph.innerHTML = `${legend}${edgeHtml}${nodeHtml}`;
 }
 
-function resetSelectedNoteEditor() {
-  if (!state.selectedNote) {
-    clearNoteEditor();
+function renderRelationList(relations, noteMap) {
+  if (!relations.length) {
+    els.relationList.innerHTML = `<li class="relation-item">暂无关系。点击“整理知识库”生成关系网络。</li>`;
     return;
   }
-  populateNoteEditor(state.selectedNote);
-  els.noteDetail.innerHTML = markdownToHtml(state.selectedNote.markdown_content || "", {
-    hideSourceInfo: true,
-    removeEmptySections: true,
-  });
+  els.relationList.innerHTML = relations
+    .slice(0, 80)
+    .map((rel) => {
+      const from = noteMap.get(rel.from_note_id);
+      const to = noteMap.get(rel.to_note_id);
+      return `
+        <li class="relation-item">
+          <strong>${escapeHtml(rel.relation_type || "related")}</strong>
+          <span>${escapeHtml((from && from.title) || rel.from_note_id)} → ${escapeHtml((to && to.title) || rel.to_note_id)}</span>
+          <small>score=${Number(rel.score || 0).toFixed(3)} ${escapeHtml(rel.reason || "")}</small>
+        </li>`;
+    })
+    .join("");
 }
 
 async function keywordSearch() {
@@ -456,75 +450,10 @@ function renderPreview(markdown) {
   });
 }
 
-function populateNoteEditor(note) {
-  els.editTitle.value = note.title || "";
-  els.editNoteType.value = note.note_type || "";
-  els.editThemes.value = (note.themes || []).join(", ");
-  els.editKeywords.value = (note.keywords || []).join(", ");
-  els.editSummary.value = note.summary || "";
-  els.editKeyPoints.value = (note.key_points || []).join("\n");
-  els.editUsageScenarios.value = (note.usage_scenarios || []).join("\n");
-  els.editUserInsights.value = note.user_insights || "";
-  els.editSourceExcerpt.value = note.source_excerpt || "";
-}
-
-function clearNoteEditor() {
-  els.editTitle.value = "";
-  els.editNoteType.value = "";
-  els.editThemes.value = "";
-  els.editKeywords.value = "";
-  els.editSummary.value = "";
-  els.editKeyPoints.value = "";
-  els.editUsageScenarios.value = "";
-  els.editUserInsights.value = "";
-  els.editSourceExcerpt.value = "";
-}
-
-function collectEditorPayload() {
-  return {
-    note_id: state.selectedNoteId,
-    title: els.editTitle.value.trim(),
-    note_type: els.editNoteType.value.trim(),
-    themes: splitCsv(els.editThemes.value),
-    keywords: splitCsv(els.editKeywords.value),
-    summary: els.editSummary.value.trim(),
-    key_points: splitLines(els.editKeyPoints.value),
-    usage_scenarios: splitLines(els.editUsageScenarios.value),
-    user_insights: els.editUserInsights.value.trim(),
-    source_excerpt: els.editSourceExcerpt.value.trim(),
-  };
-}
-
-function buildMarkdownFromEditor() {
-  const payload = collectEditorPayload();
-  const sections = [`# ${payload.title || "未命名条目"}`];
-
-  if (payload.note_type) {
-    sections.push(`## 内容类型\n${payload.note_type}`);
-  }
-  if (payload.themes.length) {
-    sections.push(`## 核心主题\n${payload.themes.map((item) => `- ${item}`).join("\n")}`);
-  }
-  if (payload.summary) {
-    sections.push(`## 摘要\n${payload.summary}`);
-  }
-  if (payload.key_points.length) {
-    sections.push(`## 关键要点\n${payload.key_points.map((item, idx) => `${idx + 1}. ${item}`).join("\n")}`);
-  }
-  if (payload.usage_scenarios.length) {
-    sections.push(`## 可用场景\n${payload.usage_scenarios.map((item) => `- ${item}`).join("\n")}`);
-  }
-  if (payload.user_insights) {
-    sections.push(`## 我的进一步想法\n${payload.user_insights}`);
-  }
-  if (payload.keywords.length) {
-    sections.push(`## 关键词\n${payload.keywords.map((item) => `- ${item}`).join("\n")}`);
-  }
-  if (payload.source_excerpt) {
-    sections.push(`## 来源摘录\n${payload.source_excerpt}`);
-  }
-
-  return `${sections.join("\n\n")}\n`;
+function compactTitle(title, maxLength) {
+  const clean = String(title || "").trim();
+  if (clean.length <= maxLength) return clean;
+  return `${clean.slice(0, maxLength - 1)}…`;
 }
 
 function appendImportLog(text) {
@@ -688,21 +617,6 @@ function isEmptySectionContent(lines) {
     .map((line) => line.replace(/^\d+\.\s*/, "").replace(/^-\s*/, "").trim());
   if (cleaned.length === 0) return true;
   return cleaned.every((line) => line === "（空）");
-}
-
-function splitCsv(text) {
-  return String(text || "")
-    .replaceAll("，", ",")
-    .split(",")
-    .map((item) => item.trim())
-    .filter(Boolean);
-}
-
-function splitLines(text) {
-  return String(text || "")
-    .split(/\r?\n/)
-    .map((item) => item.trim())
-    .filter(Boolean);
 }
 
 function escapeHtml(text) {

@@ -6,7 +6,7 @@ import sqlite3
 from collections.abc import Iterable
 from typing import Any
 
-from app.backend.models import ChunkRecord, SearchResult, SourceRecord, StructuredNote
+from app.backend.models import ChunkRecord, KnowledgeGroup, KnowledgeUnit, SearchResult, SourceRecord, StructuredNote
 
 
 class KnowledgeRepository:
@@ -65,6 +65,8 @@ class KnowledgeRepository:
             (source_id,),
         ).fetchall()
         with self.conn:
+            self.conn.execute("DELETE FROM knowledge_units WHERE source_id = ?", (source_id,))
+            self.conn.execute("DELETE FROM knowledge_groups WHERE source_id = ?", (source_id,))
             for row in note_rows:
                 self.conn.execute("DELETE FROM fts_notes WHERE note_id = ?", (row["note_id"],))
             self.conn.execute("DELETE FROM notes_structured WHERE source_id = ?", (source_id,))
@@ -160,6 +162,21 @@ class KnowledgeRepository:
         ).fetchone()
         return _note_dict(row) if row else None
 
+    def list_notes_without_units(self, *, limit: int = 1000) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            SELECT n.*, s.file_path, s.imported_at
+            FROM notes_structured n
+            LEFT JOIN knowledge_units u ON u.note_id = n.note_id
+            LEFT JOIN sources s ON s.source_id = n.source_id
+            WHERE u.unit_id IS NULL
+            ORDER BY n.updated_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [_note_dict(row) for row in rows]
+
     def list_notes_for_organize(self) -> list[dict[str, Any]]:
         rows = self.conn.execute(
             """
@@ -228,6 +245,366 @@ class KnowledgeRepository:
             if changed:
                 self._refresh_fts_by_note_id(note_id)
             return changed
+
+    def upsert_knowledge_group(self, group: KnowledgeGroup) -> None:
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO knowledge_groups (
+                  group_id, source_id, group_title, group_type, summary, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(group_id) DO UPDATE SET
+                  group_title=excluded.group_title,
+                  group_type=excluded.group_type,
+                  summary=excluded.summary,
+                  updated_at=excluded.updated_at
+                """,
+                (
+                    group.group_id,
+                    group.source_id,
+                    group.group_title,
+                    group.group_type,
+                    group.summary,
+                    group.created_at,
+                    group.updated_at,
+                ),
+            )
+
+    def get_first_group_for_source(self, source_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            """
+            SELECT *
+            FROM knowledge_groups
+            WHERE source_id = ?
+            ORDER BY created_at
+            LIMIT 1
+            """,
+            (source_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def insert_knowledge_unit(self, unit: KnowledgeUnit) -> None:
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO knowledge_units (
+                  unit_id, group_id, source_id, note_id, parent_unit_id, title, content,
+                  evidence, note_type, order_index, confidence, attributes_json,
+                  created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    unit.unit_id,
+                    unit.group_id,
+                    unit.source_id,
+                    unit.note_id,
+                    unit.parent_unit_id,
+                    unit.title,
+                    unit.content,
+                    unit.evidence,
+                    unit.note_type,
+                    unit.order_index,
+                    float(unit.confidence),
+                    _json(unit.attributes),
+                    unit.created_at,
+                    unit.updated_at,
+                ),
+            )
+
+    def update_unit_for_note(
+        self,
+        *,
+        note_id: str,
+        title: str,
+        content: str,
+        evidence: str,
+        note_type: str,
+        attributes: dict[str, Any],
+        updated_at: str,
+    ) -> None:
+        with self.conn:
+            self.conn.execute(
+                """
+                UPDATE knowledge_units
+                SET title = ?, content = ?, evidence = ?, note_type = ?,
+                    attributes_json = ?, updated_at = ?
+                WHERE note_id = ?
+                """,
+                (title, content, evidence, note_type, _json(attributes), updated_at, note_id),
+            )
+
+    def get_unit_by_note_id(self, note_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT * FROM knowledge_units WHERE note_id = ? LIMIT 1",
+            (note_id,),
+        ).fetchone()
+        if not row:
+            return None
+        data = dict(row)
+        data["attributes"] = _loads(data.pop("attributes_json", None))
+        return data
+
+    def list_units_for_relation_build(self) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            SELECT
+              u.*, g.group_title, n.updated_at AS note_updated_at,
+              n.summary AS note_summary, n.themes_json, n.keywords_json
+            FROM knowledge_units u
+            LEFT JOIN knowledge_groups g ON g.group_id = u.group_id
+            LEFT JOIN notes_structured n ON n.note_id = u.note_id
+            WHERE u.note_id IS NOT NULL
+            ORDER BY u.group_id, u.order_index, u.updated_at
+            """
+        ).fetchall()
+        data: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["attributes"] = _loads(item.pop("attributes_json", None))
+            item["themes"] = _loads(item.pop("themes_json", None))
+            item["keywords"] = _loads(item.pop("keywords_json", None))
+            data.append(item)
+        return data
+
+    def list_unit_keyword_links(self) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            SELECT
+              u.unit_id, u.note_id, uk.term_id, uk.confidence, uk.matched_by,
+              t.canonical_name
+            FROM unit_keywords uk
+            JOIN knowledge_units u ON u.unit_id = uk.unit_id
+            JOIN keyword_terms t ON t.term_id = uk.term_id
+            WHERE u.note_id IS NOT NULL
+            ORDER BY t.canonical_name, u.note_id
+            """
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def find_keyword_term(self, normalized_name: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT * FROM keyword_terms WHERE normalized_name = ? LIMIT 1",
+            (normalized_name,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def find_keyword_alias(self, normalized_alias: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            """
+            SELECT t.*, a.alias, a.normalized_alias
+            FROM keyword_aliases a
+            JOIN keyword_terms t ON t.term_id = a.term_id
+            WHERE a.normalized_alias = ?
+            LIMIT 1
+            """,
+            (normalized_alias,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def list_keyword_terms(self) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            SELECT t.*,
+                   GROUP_CONCAT(a.alias, '||') AS aliases,
+                   GROUP_CONCAT(a.normalized_alias, '||') AS normalized_aliases
+            FROM keyword_terms t
+            LEFT JOIN keyword_aliases a ON a.term_id = t.term_id
+            GROUP BY t.term_id
+            ORDER BY t.canonical_name
+            """
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def insert_keyword_term(
+        self,
+        *,
+        term_id: str,
+        canonical_name: str,
+        normalized_name: str,
+        description: str,
+        created_at: str,
+        updated_at: str,
+    ) -> None:
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT OR IGNORE INTO keyword_terms (
+                  term_id, canonical_name, normalized_name, description, status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 'active', ?, ?)
+                """,
+                (term_id, canonical_name, normalized_name, description, created_at, updated_at),
+            )
+
+    def insert_keyword_alias(
+        self,
+        *,
+        alias_id: str,
+        term_id: str,
+        alias: str,
+        normalized_alias: str,
+        source: str,
+        confidence: float,
+        created_at: str,
+    ) -> None:
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT OR IGNORE INTO keyword_aliases (
+                  alias_id, term_id, alias, normalized_alias, source, confidence, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (alias_id, term_id, alias, normalized_alias, source, float(confidence), created_at),
+            )
+
+    def replace_unit_keywords(self, unit_id: str, keyword_links: list[dict[str, Any]]) -> None:
+        with self.conn:
+            self.conn.execute("DELETE FROM unit_keywords WHERE unit_id = ?", (unit_id,))
+            for link in keyword_links:
+                self.conn.execute(
+                    """
+                    INSERT OR REPLACE INTO unit_keywords (
+                      unit_id, term_id, confidence, matched_by
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        unit_id,
+                        link["term_id"],
+                        float(link.get("confidence", 0.8)),
+                        link.get("matched_by") or "",
+                    ),
+                )
+
+    def search_notes_by_keyword_names(self, names: list[str], *, limit: int = 10) -> list[SearchResult]:
+        normalized = _keyword_query_keys(names)
+        if not normalized:
+            return []
+        placeholders = ",".join("?" for _ in normalized)
+        rows = self.conn.execute(
+            f"""
+            SELECT DISTINCT
+              n.*, s.file_path, s.imported_at,
+              5.0 AS score,
+              'keyword:' || t.canonical_name AS snippet
+            FROM keyword_terms t
+            LEFT JOIN keyword_aliases a ON a.term_id = t.term_id
+            JOIN unit_keywords uk ON uk.term_id = t.term_id
+            JOIN knowledge_units u ON u.unit_id = uk.unit_id
+            JOIN notes_structured n ON n.note_id = u.note_id
+            LEFT JOIN sources s ON s.source_id = n.source_id
+            WHERE t.normalized_name IN ({placeholders})
+               OR a.normalized_alias IN ({placeholders})
+            ORDER BY n.updated_at DESC
+            LIMIT ?
+            """,
+            (*normalized, *normalized, limit),
+        ).fetchall()
+        return [_search_result(row) for row in rows]
+
+    def search_notes_by_title(self, query: str, *, limit: int = 10) -> list[SearchResult]:
+        terms = _query_terms(query)
+        if not terms:
+            return []
+        filters = " OR ".join("n.title LIKE ?" for _ in terms)
+        params = [f"%{term}%" for term in terms]
+        rows = self.conn.execute(
+            f"""
+            SELECT DISTINCT
+              n.*, s.file_path, s.imported_at,
+              2.0 AS score,
+              'title:' || n.title AS snippet
+            FROM notes_structured n
+            LEFT JOIN sources s ON s.source_id = n.source_id
+            WHERE {filters}
+            ORDER BY n.updated_at DESC
+            LIMIT ?
+            """,
+            (*params, limit),
+        ).fetchall()
+        return [_search_result(row) for row in rows]
+
+    def search_notes_by_unit_text(self, query: str, *, limit: int = 10) -> list[SearchResult]:
+        terms = _query_terms(query)
+        if not terms:
+            return []
+        filters = " OR ".join("(u.title LIKE ? OR u.content LIKE ? OR u.evidence LIKE ?)" for _ in terms)
+        params: list[Any] = []
+        for term in terms:
+            like = f"%{term}%"
+            params.extend([like, like, like])
+        rows = self.conn.execute(
+            f"""
+            SELECT DISTINCT
+              n.*, s.file_path, s.imported_at,
+              8.0 AS score,
+              'unit:' || COALESCE(u.title, n.title) AS snippet
+            FROM knowledge_units u
+            JOIN notes_structured n ON n.note_id = u.note_id
+            LEFT JOIN sources s ON s.source_id = n.source_id
+            WHERE {filters}
+            ORDER BY n.updated_at DESC
+            LIMIT ?
+            """,
+            (*params, limit),
+        ).fetchall()
+        return [_search_result(row) for row in rows]
+
+    def get_group_peer_notes(self, note_ids: list[str], *, limit: int = 8) -> list[SearchResult]:
+        normalized_ids = [note_id for note_id in note_ids if note_id]
+        if not normalized_ids:
+            return []
+        placeholders = ",".join("?" for _ in normalized_ids)
+        rows = self.conn.execute(
+            f"""
+            SELECT DISTINCT
+              n.*, s.file_path, s.imported_at,
+              40.0 AS score,
+              'same_group:' || COALESCE(g.group_title, '') AS snippet
+            FROM knowledge_units seed
+            JOIN knowledge_units peer ON peer.group_id = seed.group_id
+              AND peer.note_id IS NOT NULL
+              AND peer.note_id != seed.note_id
+            JOIN notes_structured n ON n.note_id = peer.note_id
+            LEFT JOIN knowledge_groups g ON g.group_id = peer.group_id
+            LEFT JOIN sources s ON s.source_id = n.source_id
+            WHERE seed.note_id IN ({placeholders})
+              AND peer.note_id NOT IN ({placeholders})
+            ORDER BY peer.order_index ASC, n.updated_at DESC
+            LIMIT ?
+            """,
+            (*normalized_ids, *normalized_ids, limit),
+        ).fetchall()
+        return [_search_result(row) for row in rows]
+
+    def get_relation_peer_notes(self, note_ids: list[str], *, limit: int = 8) -> list[SearchResult]:
+        normalized_ids = [note_id for note_id in note_ids if note_id]
+        if not normalized_ids:
+            return []
+        placeholders = ",".join("?" for _ in normalized_ids)
+        rows = self.conn.execute(
+            f"""
+            WITH peers AS (
+              SELECT to_note_id AS note_id, relation_type, score AS rel_score
+              FROM knowledge_relations
+              WHERE from_note_id IN ({placeholders})
+              UNION ALL
+              SELECT from_note_id AS note_id, relation_type, score AS rel_score
+              FROM knowledge_relations
+              WHERE to_note_id IN ({placeholders})
+            )
+            SELECT DISTINCT
+              n.*, s.file_path, s.imported_at,
+              55.0 AS score,
+              'relation:' || peers.relation_type AS snippet
+            FROM peers
+            JOIN notes_structured n ON n.note_id = peers.note_id
+            LEFT JOIN sources s ON s.source_id = n.source_id
+            WHERE peers.note_id NOT IN ({placeholders})
+            ORDER BY peers.rel_score DESC, n.updated_at DESC
+            LIMIT ?
+            """,
+            (*normalized_ids, *normalized_ids, *normalized_ids, limit),
+        ).fetchall()
+        return [_search_result(row) for row in rows]
 
     def search_notes(
         self,
@@ -555,7 +932,46 @@ def _search_result(row: sqlite3.Row) -> SearchResult:
 
 
 def _match_query(query: str) -> str:
-    tokens = re.findall(r"[\w\u4e00-\u9fff]+", query, flags=re.UNICODE)
+    tokens = _query_terms(query)
     if not tokens:
         return ""
     return " OR ".join(f'"{token.replace(chr(34), chr(34) + chr(34))}"' for token in tokens[:8])
+
+
+def _query_terms(query: str) -> list[str]:
+    tokens = re.findall(r"[\w\u4e00-\u9fff]+", query, flags=re.UNICODE)
+    seen: set[str] = set()
+    result: list[str] = []
+    for token in tokens:
+        token = token.strip()
+        if not token:
+            continue
+        if len(token) < 2 and not token.isascii():
+            continue
+        key = token.lower()
+        if key not in seen:
+            result.append(token)
+            seen.add(key)
+    return result[:12]
+
+
+def _normalize_keyword_name(value: str) -> str:
+    return re.sub(r"[\s_\-·•/／]+", "", str(value).strip().lower())
+
+
+def _keyword_query_keys(values: list[str]) -> list[str]:
+    suffixes = ("技术", "方法", "方式", "机制", "模型", "系统", "体系", "理论", "研究", "分析", "工具", "策略")
+    keys: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        normalized = _normalize_keyword_name(value)
+        candidates = [normalized]
+        for suffix in suffixes:
+            if normalized.endswith(suffix) and len(normalized) > len(suffix) + 2:
+                candidates.append(normalized[: -len(suffix)])
+                break
+        for candidate in candidates:
+            if candidate and candidate not in seen:
+                keys.append(candidate)
+                seen.add(candidate)
+    return keys

@@ -18,7 +18,9 @@ from app.backend.database.repository import KnowledgeRepository
 from app.backend.export.markdown_exporter import export_markdown, safe_filename
 from app.backend.formatter.markdown_builder import build_note_markdown
 from app.backend.importer.text_importer import build_file_source, build_manual_source
+from app.backend.keywords.normalizer import canonicalize_keywords
 from app.backend.llm.client import QwenClient
+from app.backend.maintenance.v2_backfill import backfill_v2_structures
 from app.backend.organizer.knowledge_organizer import organize_knowledge_base
 from app.backend.retrieval.answer_builder import build_answer
 from app.backend.retrieval.search_service import SearchService
@@ -139,6 +141,27 @@ class RequestHandler(BaseHTTPRequestHandler):
                     service = SearchService(ctx.repo, ctx.llm_client, ctx.logger)
                     results = service.keyword_search(query, limit=limit)
                     self._json_response(HTTPStatus.OK, {"results": [_result_dict(item) for item in results]})
+                finally:
+                    ctx.close()
+                return
+
+            if parsed.path == "/api/keywords":
+                ctx = ServiceContext.from_runtime(self.runtime)
+                try:
+                    keywords = []
+                    for item in ctx.repo.list_keyword_terms():
+                        aliases = [part for part in str(item.get("aliases") or "").split("||") if part]
+                        keywords.append(
+                            {
+                                "term_id": item.get("term_id"),
+                                "canonical_name": item.get("canonical_name"),
+                                "description": item.get("description") or "",
+                                "status": item.get("status") or "active",
+                                "aliases": aliases,
+                                "updated_at": item.get("updated_at"),
+                            }
+                        )
+                    self._json_response(HTTPStatus.OK, {"keywords": keywords})
                 finally:
                     ctx.close()
                 return
@@ -410,6 +433,13 @@ class RequestHandler(BaseHTTPRequestHandler):
                         self._json_response(HTTPStatus.NOT_FOUND, {"error": "Source not found"})
                         return
                     normalized = _normalize_note_payload(payload, existing)
+                    canonical_keywords, keyword_links = canonicalize_keywords(
+                        ctx.repo,
+                        [*normalized["keywords"], *normalized["themes"]],
+                        source="manual_edit",
+                    )
+                    if canonical_keywords:
+                        normalized["keywords"] = canonical_keywords[:12]
                     markdown_content = build_note_markdown(normalized, source)
                     updated = ctx.repo.update_note_structured(
                         note_id=note_id,
@@ -428,6 +458,23 @@ class RequestHandler(BaseHTTPRequestHandler):
                     if not updated:
                         self._json_response(HTTPStatus.NOT_FOUND, {"error": "Note not found"})
                         return
+                    ctx.repo.update_unit_for_note(
+                        note_id=note_id,
+                        title=normalized["title"],
+                        content=_unit_content_from_payload(normalized),
+                        evidence=normalized["source_excerpt"],
+                        note_type=normalized["note_type"],
+                        attributes={
+                            "themes": normalized["themes"],
+                            "key_points": normalized["key_points"],
+                            "usage_scenarios": normalized["usage_scenarios"],
+                            "user_insights": normalized["user_insights"],
+                        },
+                        updated_at=utc_now_iso(),
+                    )
+                    unit = ctx.repo.get_unit_by_note_id(note_id)
+                    if unit:
+                        ctx.repo.replace_unit_keywords(unit["unit_id"], keyword_links)
                     self._json_response(HTTPStatus.OK, {"status": "ok", "note": ctx.repo.get_note(note_id)})
                 finally:
                     ctx.close()
@@ -588,6 +635,17 @@ def _normalize_note_payload(payload: dict, existing: dict) -> dict:
     }
 
 
+def _unit_content_from_payload(payload: dict) -> str:
+    parts: list[str] = []
+    if payload.get("summary"):
+        parts.append(str(payload["summary"]))
+    for item in payload.get("key_points") or []:
+        parts.append(f"- {item}")
+    if payload.get("user_insights"):
+        parts.append(str(payload["user_insights"]))
+    return "\n".join(parts).strip() or str(payload.get("source_excerpt") or "")
+
+
 def _run_organize_job(runtime: Runtime, run_id: str) -> None:
     def set_live(status: str, message: str, percent: int) -> None:
         with runtime.organize_lock:
@@ -656,6 +714,7 @@ def run_server(*, host: str, port: int) -> None:
     )
     if not runtime.frontend_dir.exists():
         raise RuntimeError(f"Frontend directory not found: {runtime.frontend_dir}")
+    backfill_v2_structures(runtime.repo, runtime.logger)
 
     handler_cls = type("BoundHandler", (RequestHandler,), {"runtime": runtime})
     server = HTTPServer((host, port), handler_cls)

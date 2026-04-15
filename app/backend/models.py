@@ -64,6 +64,46 @@ class StructuredNote:
 
 
 @dataclass
+class KnowledgeGroup:
+    group_id: str
+    source_id: str
+    group_title: str
+    group_type: str = ""
+    summary: str = ""
+    created_at: str = ""
+    updated_at: str = ""
+
+
+@dataclass
+class KnowledgeUnit:
+    unit_id: str
+    group_id: str | None
+    source_id: str
+    note_id: str | None
+    title: str
+    content: str
+    evidence: str = ""
+    note_type: str = ""
+    order_index: int = 0
+    confidence: float = 0.7
+    attributes: dict[str, Any] = field(default_factory=dict)
+    parent_unit_id: str | None = None
+    created_at: str = ""
+    updated_at: str = ""
+
+
+@dataclass
+class KeywordTerm:
+    term_id: str
+    canonical_name: str
+    normalized_name: str
+    description: str = ""
+    status: str = "active"
+    created_at: str = ""
+    updated_at: str = ""
+
+
+@dataclass
 class ChunkRecord:
     chunk_id: str
     note_id: str
@@ -106,4 +146,3 @@ def _string_list(value: Any) -> list[str]:
     if isinstance(value, str):
         return [part.strip() for part in value.replace("，", ",").split(",") if part.strip()]
     return [str(value).strip()]
-

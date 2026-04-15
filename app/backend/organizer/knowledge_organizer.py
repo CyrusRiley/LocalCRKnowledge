@@ -10,6 +10,7 @@ from uuid import uuid4
 
 from app.backend.database.repository import KnowledgeRepository
 from app.backend.preprocess.cleaner import extract_keywords
+from app.backend.relations.relation_builder import build_structural_relations, dedupe_relations
 from app.backend.utils.time_utils import utc_now_iso
 
 
@@ -61,7 +62,13 @@ def organize_knowledge_base(
     push("running", "Loading notes...", 5)
     notes = repo.list_notes_for_organize()
     if not notes:
-        stats = {"total_notes_before": 0, "total_notes_after": 0, "removed_duplicates": 0, "relations_saved": 0}
+        stats = {
+            "total_notes_before": 0,
+            "total_notes_after": 0,
+            "removed_duplicates": 0,
+            "duplicate_candidates": 0,
+            "relations_saved": 0,
+        }
         report = _build_report(stats, [], [])
         return {"stats": stats, "report_markdown": report, "relations": []}
 
@@ -79,20 +86,14 @@ def organize_knowledge_base(
         root = uf.find(note_id)
         clusters.setdefault(root, []).append(note_id)
 
-    keepers: set[str] = set()
     duplicate_map: dict[str, str] = {}
     for member_ids in clusters.values():
         keeper = _pick_keeper([note_by_id[note_id] for note_id in member_ids])
-        keepers.add(keeper)
         for note_id in member_ids:
             if note_id != keeper:
                 duplicate_map[note_id] = keeper
 
-    push("running", "Pruning duplicate notes...", 45)
-    for dup_id in duplicate_map:
-        repo.delete_note(dup_id)
-
-    push("running", "Building knowledge relations...", 70)
+    push("running", "Building knowledge relations...", 55)
     relations: list[dict] = []
     now = utc_now_iso()
     for dup_id, keeper_id in duplicate_map.items():
@@ -103,7 +104,7 @@ def organize_knowledge_base(
                 "to_note_id": keeper_id,
                 "relation_type": "duplicate_of",
                 "score": 1.0,
-                "reason": "high lexical similarity",
+                "reason": "high lexical similarity; kept as candidate, not deleted automatically",
                 "created_at": now,
             }
         )
@@ -130,14 +131,16 @@ def organize_knowledge_base(
             }
         )
 
-    relations = sorted(relations, key=lambda item: (-float(item["score"]), item["relation_type"]))[:2000]
+    push("running", "Adding group, sequence, and keyword relations...", 75)
+    relations = dedupe_relations([*relations, *build_structural_relations(repo)])
     repo.replace_relations_for_run(run_id, relations)
 
     push("running", "Generating report...", 90)
     stats = {
         "total_notes_before": len(vectors),
-        "total_notes_after": len(keepers),
-        "removed_duplicates": len(duplicate_map),
+        "total_notes_after": len(vectors),
+        "removed_duplicates": 0,
+        "duplicate_candidates": len(duplicate_map),
         "duplicate_clusters": sum(1 for values in clusters.values() if len(values) > 1),
         "relations_saved": len(relations),
     }
@@ -276,7 +279,8 @@ def _build_report(stats: dict, clusters: dict[str, list[str]] | list, relations:
         "## 统计信息",
         f"- 整理前条目数: {stats.get('total_notes_before', 0)}",
         f"- 整理后条目数: {stats.get('total_notes_after', 0)}",
-        f"- 去重删除条目数: {stats.get('removed_duplicates', 0)}",
+        f"- 自动删除条目数: {stats.get('removed_duplicates', 0)}",
+        f"- 重复候选条目数: {stats.get('duplicate_candidates', 0)}",
         f"- 发现重复簇数量: {stats.get('duplicate_clusters', 0)}",
         f"- 保存关系数量: {stats.get('relations_saved', 0)}",
         "",

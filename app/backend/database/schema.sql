@@ -86,3 +86,77 @@ CREATE TABLE IF NOT EXISTS knowledge_relations (
 CREATE INDEX IF NOT EXISTS idx_relations_run ON knowledge_relations(run_id);
 CREATE INDEX IF NOT EXISTS idx_relations_from_note ON knowledge_relations(from_note_id);
 CREATE INDEX IF NOT EXISTS idx_relations_to_note ON knowledge_relations(to_note_id);
+
+CREATE TABLE IF NOT EXISTS knowledge_groups (
+  group_id TEXT PRIMARY KEY,
+  source_id TEXT NOT NULL,
+  group_title TEXT NOT NULL,
+  group_type TEXT,
+  summary TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY(source_id) REFERENCES sources(source_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_knowledge_groups_source ON knowledge_groups(source_id);
+
+CREATE TABLE IF NOT EXISTS knowledge_units (
+  unit_id TEXT PRIMARY KEY,
+  group_id TEXT,
+  source_id TEXT NOT NULL,
+  note_id TEXT UNIQUE,
+  parent_unit_id TEXT,
+  title TEXT NOT NULL,
+  content TEXT NOT NULL,
+  evidence TEXT,
+  note_type TEXT,
+  order_index INTEGER NOT NULL,
+  confidence REAL NOT NULL DEFAULT 0.7,
+  attributes_json TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY(group_id) REFERENCES knowledge_groups(group_id) ON DELETE SET NULL,
+  FOREIGN KEY(source_id) REFERENCES sources(source_id) ON DELETE CASCADE,
+  FOREIGN KEY(note_id) REFERENCES notes_structured(note_id) ON DELETE CASCADE,
+  FOREIGN KEY(parent_unit_id) REFERENCES knowledge_units(unit_id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_units_source ON knowledge_units(source_id);
+CREATE INDEX IF NOT EXISTS idx_units_group ON knowledge_units(group_id);
+CREATE INDEX IF NOT EXISTS idx_units_note ON knowledge_units(note_id);
+CREATE INDEX IF NOT EXISTS idx_units_type ON knowledge_units(note_type);
+
+CREATE TABLE IF NOT EXISTS keyword_terms (
+  term_id TEXT PRIMARY KEY,
+  canonical_name TEXT NOT NULL UNIQUE,
+  normalized_name TEXT NOT NULL UNIQUE,
+  description TEXT,
+  status TEXT NOT NULL DEFAULT 'active',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS keyword_aliases (
+  alias_id TEXT PRIMARY KEY,
+  term_id TEXT NOT NULL,
+  alias TEXT NOT NULL,
+  normalized_alias TEXT NOT NULL UNIQUE,
+  source TEXT,
+  confidence REAL NOT NULL DEFAULT 0.8,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(term_id) REFERENCES keyword_terms(term_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_keyword_aliases_term ON keyword_aliases(term_id);
+
+CREATE TABLE IF NOT EXISTS unit_keywords (
+  unit_id TEXT NOT NULL,
+  term_id TEXT NOT NULL,
+  confidence REAL NOT NULL DEFAULT 0.8,
+  matched_by TEXT,
+  PRIMARY KEY(unit_id, term_id),
+  FOREIGN KEY(unit_id) REFERENCES knowledge_units(unit_id) ON DELETE CASCADE,
+  FOREIGN KEY(term_id) REFERENCES keyword_terms(term_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_unit_keywords_term ON unit_keywords(term_id);
