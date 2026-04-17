@@ -18,6 +18,7 @@ from app.backend.organizer.knowledge_organizer import organize_knowledge_base
 from app.backend.preprocess.cleaner import build_chunk_contexts, chunk_text, normalize_text, preprocess_text
 from app.backend.relations.relation_builder import build_structural_relations
 from app.backend.retrieval.answer_builder import build_answer_result
+from app.backend.retrieval.graph_builder import build_library_graph
 from app.backend.retrieval.search_service import SearchService
 from app.backend.utils.logger import setup_logger
 from app.backend.utils.time_utils import utc_now_iso
@@ -60,6 +61,12 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(payload["title"], "标题")
         self.assertEqual(payload["note_type"], "未分类")
         self.assertEqual(payload["themes"], ["公共空间"])
+        self.assertEqual(payload["faithful_content"], "原文内容")
+
+    def test_parser_keeps_faithful_content_from_json(self) -> None:
+        content = '{"title":"ABM method","faithful_content":"This unit preserves the full method description."}'
+        payload = parse_note_json(content, fallback_title="Fallback", source_text="raw source")
+        self.assertEqual(payload["faithful_content"], "This unit preserves the full method description.")
 
     def test_parser_recovers_structure_marker_array(self) -> None:
         content = '```json\n[{"title":"技术路径","start_quote":"一、技术路径","end_quote":"完整说明。"}]\n```'
@@ -136,6 +143,32 @@ class BackendTests(unittest.TestCase):
         results = repo.search_notes("人行为模拟技术经历几次发展转向", limit=5)
         self.assertEqual(results[0].note_id, "note-chinese-search")
 
+    def test_repository_searches_faithful_content(self) -> None:
+        conn = memory_conn()
+        repo = KnowledgeRepository(conn)
+        source = _source("raw text")
+        source.clean_text = source.raw_text
+        repo.upsert_source(source)
+        note = _note("note-faithful", source.source_id, "Faithful field", "Short summary", ["method"])
+        note.faithful_content = "The detailed preserved content mentions sidewalk permeability and route choice."
+        note.markdown_content = "# Faithful field\n\nShort summary"
+        repo.insert_note(note, [])
+        results = repo.search_notes("sidewalk permeability", limit=5)
+        self.assertEqual(results[0].note_id, "note-faithful")
+
+    def test_repository_import_history_counts_notes_by_source(self) -> None:
+        conn = memory_conn()
+        repo = KnowledgeRepository(conn)
+        source = _source("demo import history")
+        source.clean_text = source.raw_text
+        repo.upsert_source(source)
+        note = _note("history-note", source.source_id, "History Note", "A note for import history.", ["history"])
+        repo.insert_note(note, [ChunkRecord("history-chunk", note.note_id, note.summary, 0, "source_chunk", note.keywords)])
+        history = repo.list_import_history(limit=5)
+        self.assertEqual(history[0]["source_id"], source.source_id)
+        self.assertEqual(history[0]["note_count"], 1)
+        self.assertIn("History Note", history[0]["note_titles"])
+
     def test_answer_builder_reports_extract_mode_without_results(self) -> None:
         result = build_answer_result(
             "没有命中的问题",
@@ -199,6 +232,7 @@ class BackendTests(unittest.TestCase):
             note_type="论文修改意见",
             themes=["更新主题"],
             summary="更新摘要",
+            faithful_content="更新保真整理内容 包含 新词汇",
             key_points=["更新要点"],
             usage_scenarios=["更新场景"],
             user_insights="更新想法",
@@ -357,7 +391,7 @@ class BackendTests(unittest.TestCase):
         self.assertTrue(repo.get_unit_by_note_id("legacy-note"))
         self.assertTrue(repo.search_notes_by_keyword_names(["行为模拟方法"], limit=5))
 
-    def test_search_expands_to_same_group_units(self) -> None:
+    def test_search_expands_to_near_group_units(self) -> None:
         os.environ["LK_DISABLE_LLM"] = "1"
         conn = memory_conn()
         repo = KnowledgeRepository(conn)
@@ -413,6 +447,9 @@ class BackendTests(unittest.TestCase):
                     "from_note_id": note_a.note_id,
                     "to_note_id": note_b.note_id,
                     "relation_type": "supports",
+                    "relation_layer": "semantic",
+                    "relation_strength": "strong",
+                    "display_default": True,
                     "score": 0.9,
                     "reason": "test relation",
                     "created_at": now,
@@ -425,7 +462,7 @@ class BackendTests(unittest.TestCase):
         self.assertIn("note-evidence", {item.note_id for item in results})
         os.environ.pop("LK_DISABLE_LLM", None)
 
-    def test_relation_builder_creates_group_sequence_and_keyword_relations(self) -> None:
+    def test_relation_builder_creates_layered_sequence_without_group_mesh(self) -> None:
         conn = memory_conn()
         repo = KnowledgeRepository(conn)
         source = _source("relation builder")
@@ -452,15 +489,145 @@ class BackendTests(unittest.TestCase):
         repo.insert_knowledge_unit(
             KnowledgeUnit("unit-rel-b", group_id, source.source_id, note_b.note_id, note_b.title, note_b.summary, order_index=1, created_at=now, updated_at=now)
         )
-        _, links_a = canonicalize_keywords(repo, ["behavior simulation"], source="test")
-        _, links_b = canonicalize_keywords(repo, ["behavior simulation"], source="test")
+        _, links_a = canonicalize_keywords(repo, ["behavior simulation", "public space"], source="test")
+        _, links_b = canonicalize_keywords(repo, ["behavior simulation", "public space"], source="test")
         repo.replace_unit_keywords("unit-rel-a", links_a)
         repo.replace_unit_keywords("unit-rel-b", links_b)
         relations = build_structural_relations(repo)
         relation_types = {item["relation_type"] for item in relations}
-        self.assertIn("same_group", relation_types)
         self.assertIn("sequence_next", relation_types)
+        self.assertNotIn("same_group", relation_types)
         self.assertIn("shared_keyword", relation_types)
+        sequence = next(item for item in relations if item["relation_type"] == "sequence_next")
+        shared = next(item for item in relations if item["relation_type"] == "shared_keyword")
+        self.assertEqual(sequence["relation_layer"], "structure")
+        self.assertTrue(sequence["display_default"])
+        self.assertEqual(shared["relation_layer"], "weak")
+        self.assertFalse(shared["display_default"])
+
+    def test_relation_builder_creates_semantic_relations(self) -> None:
+        conn = memory_conn()
+        repo = KnowledgeRepository(conn)
+        source = _source("semantic relation builder")
+        source.clean_text = source.raw_text
+        repo.upsert_source(source)
+        now = utc_now_iso()
+        group_id = "group-semantic-rel"
+        repo.upsert_knowledge_group(
+            KnowledgeGroup(
+                group_id=group_id,
+                source_id=source.source_id,
+                group_title="Semantic group",
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        note_method = _note(
+            "semantic-method",
+            source.source_id,
+            "ABM method",
+            "This method uses an agent based model and parameter calibration.",
+            ["ABM"],
+        )
+        note_case = _note(
+            "semantic-case",
+            source.source_id,
+            "Route choice case",
+            "This application case uses observations for route choice scenarios.",
+            ["route choice"],
+        )
+        repo.insert_note(note_method, [])
+        repo.insert_note(note_case, [])
+        repo.insert_knowledge_unit(
+            KnowledgeUnit(
+                "unit-semantic-method",
+                group_id,
+                source.source_id,
+                note_method.note_id,
+                note_method.title,
+                note_method.summary,
+                order_index=0,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        repo.insert_knowledge_unit(
+            KnowledgeUnit(
+                "unit-semantic-case",
+                group_id,
+                source.source_id,
+                note_case.note_id,
+                note_case.title,
+                note_case.summary,
+                order_index=1,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        relations = build_structural_relations(repo)
+        relation_types = {item["relation_type"] for item in relations}
+        self.assertIn("method_for", relation_types)
+        method_rel = next(item for item in relations if item["relation_type"] == "method_for")
+        self.assertEqual(method_rel["relation_layer"], "semantic")
+        self.assertEqual(method_rel["relation_strength"], "strong")
+
+    def test_library_graph_builds_structure_nodes_and_semantic_edges(self) -> None:
+        conn = memory_conn()
+        repo = KnowledgeRepository(conn)
+        source = _source("graph source")
+        source.clean_text = source.raw_text
+        repo.upsert_source(source)
+        now = utc_now_iso()
+        group_id = "group-graph"
+        repo.upsert_knowledge_group(
+            KnowledgeGroup(
+                group_id=group_id,
+                source_id=source.source_id,
+                group_title="Graph group",
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        note_a = _note("graph-a", source.source_id, "ABM method", "ABM method for route choice.", ["ABM"])
+        note_b = _note("graph-b", source.source_id, "Route case", "Observation case for route choice.", ["route choice"])
+        repo.insert_note(note_a, [])
+        repo.insert_note(note_b, [])
+        repo.insert_knowledge_unit(
+            KnowledgeUnit("unit-graph-a", group_id, source.source_id, note_a.note_id, note_a.title, note_a.summary, order_index=0, created_at=now, updated_at=now)
+        )
+        repo.insert_knowledge_unit(
+            KnowledgeUnit("unit-graph-b", group_id, source.source_id, note_b.note_id, note_b.title, note_b.summary, order_index=1, created_at=now, updated_at=now)
+        )
+        _, links = canonicalize_keywords(repo, ["ABM"], source="test")
+        repo.replace_unit_keywords("unit-graph-a", links)
+        run_id = "run-graph"
+        repo.create_organize_run(run_id, status="completed", started_at=now)
+        repo.replace_relations_for_run(
+            run_id,
+            [
+                {
+                    "relation_id": "rel-graph",
+                    "from_note_id": note_a.note_id,
+                    "to_note_id": note_b.note_id,
+                    "relation_type": "method_for",
+                    "relation_layer": "semantic",
+                    "relation_strength": "strong",
+                    "display_default": True,
+                    "score": 0.9,
+                    "reason": "test semantic relation",
+                    "created_at": now,
+                }
+            ],
+        )
+        graph = build_library_graph(repo, limit=20)
+        node_types = {item["node_type"] for item in graph["nodes"]}
+        edge_types = {item["relation_type"] for item in graph["edges"]}
+        self.assertIn("group", node_types)
+        self.assertIn("concept", node_types)
+        self.assertIn("unit", node_types)
+        self.assertIn("contains", edge_types)
+        self.assertIn("concept_contains", edge_types)
+        self.assertIn("method_for", edge_types)
 
     def test_organize_knowledge_base_marks_duplicates_and_relates(self) -> None:
         conn = memory_conn()
@@ -529,6 +696,69 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(result["stats"]["duplicate_candidates"], 1)
         self.assertEqual(len(remaining), 3)
         self.assertTrue(repo.list_relations_for_run(run_id, limit=20))
+
+    def test_quick_organize_keeps_old_relations_and_updates_changed_notes(self) -> None:
+        conn = memory_conn()
+        repo = KnowledgeRepository(conn)
+        source = _source("quick organize")
+        source.clean_text = source.raw_text
+        repo.upsert_source(source)
+        now = utc_now_iso()
+        group_id = "group-quick-organize"
+        repo.upsert_knowledge_group(
+            KnowledgeGroup(
+                group_id=group_id,
+                source_id=source.source_id,
+                group_title="Quick group",
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        note_a = _note("quick-a", source.source_id, "Existing method", "ABM method for behavior simulation.", ["ABM"])
+        note_b = _note("quick-b", source.source_id, "Existing case", "Application case for behavior simulation.", ["case"])
+        note_c = _note("quick-c", source.source_id, "New evidence", "Observation evidence supports the case.", ["evidence"])
+        note_a.updated_at = "2000-01-01T00:00:00+00:00"
+        note_b.updated_at = "2000-01-01T00:00:00+00:00"
+        repo.insert_note(note_a, [])
+        repo.insert_note(note_b, [])
+        repo.insert_knowledge_unit(
+            KnowledgeUnit("unit-quick-a", group_id, source.source_id, note_a.note_id, note_a.title, note_a.summary, order_index=0, created_at=now, updated_at=now)
+        )
+        repo.insert_knowledge_unit(
+            KnowledgeUnit("unit-quick-b", group_id, source.source_id, note_b.note_id, note_b.title, note_b.summary, order_index=1, created_at=now, updated_at=now)
+        )
+        previous_run = "run-quick-old"
+        repo.create_organize_run(previous_run, status="completed", started_at="2000-01-01T00:00:00+00:00")
+        repo.update_organize_run(previous_run, status="completed", finished_at="2000-01-01T00:00:01+00:00", stats={}, report_markdown="")
+        repo.replace_relations_for_run(
+            previous_run,
+            [
+                {
+                    "relation_id": "old-rel-quick",
+                    "from_note_id": note_a.note_id,
+                    "to_note_id": note_b.note_id,
+                    "relation_type": "method_for",
+                    "relation_layer": "semantic",
+                    "relation_strength": "strong",
+                    "display_default": True,
+                    "score": 0.9,
+                    "reason": "old relation",
+                    "created_at": now,
+                }
+            ],
+        )
+        repo.insert_note(note_c, [])
+        repo.insert_knowledge_unit(
+            KnowledgeUnit("unit-quick-c", group_id, source.source_id, note_c.note_id, note_c.title, note_c.summary, order_index=2, created_at=utc_now_iso(), updated_at=utc_now_iso())
+        )
+        quick_run = "run-quick-new"
+        repo.create_organize_run(quick_run, status="running", started_at=utc_now_iso())
+        result = organize_knowledge_base(repo, run_id=quick_run, logger=setup_logger(Path("data/logs"), name="organize_quick_test"), mode="quick")
+        relation_types = {rel["relation_type"] for rel in result["relations"]}
+        self.assertEqual(result["stats"]["mode"], "quick")
+        self.assertEqual(result["stats"]["affected_notes"], 1)
+        self.assertIn("method_for", relation_types)
+        self.assertIn("sequence_next", relation_types)
 
 
 def memory_conn() -> sqlite3.Connection:

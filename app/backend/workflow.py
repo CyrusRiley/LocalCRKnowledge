@@ -125,6 +125,8 @@ def process_source(
 
         raw_keywords = [*payload.get("keywords", []), *payload.get("themes", []), *chunk_keywords]
         canonical_keywords, keyword_links = canonicalize_keywords(repo, raw_keywords, source="import")
+        if not str(payload.get("faithful_content") or "").strip():
+            payload["faithful_content"] = ctx.chunk_text[:1200]
         if canonical_keywords:
             payload["keywords"] = canonical_keywords[:12]
             if not payload.get("themes"):
@@ -169,6 +171,7 @@ def process_source(
                 confidence=0.55 if chunk_llm_failed else 0.78,
                 attributes={
                     "themes": note.themes,
+                    "faithful_content": note.faithful_content[:1200],
                     "key_points": note.key_points,
                     "usage_scenarios": note.usage_scenarios,
                     "user_insights": note.user_insights,
@@ -202,6 +205,7 @@ def fallback_payload(title: str, clean_text: str, pre_keywords: list[str]) -> di
             "note_type": "待模型整理",
             "themes": [],
             "summary": clean_text[:160],
+            "faithful_content": clean_text[:1200],
             "key_points": [line.strip("- ") for line in clean_text.splitlines() if line.strip()][:5],
             "usage_scenarios": [],
             "user_insights": "",
@@ -215,6 +219,8 @@ def fallback_payload(title: str, clean_text: str, pre_keywords: list[str]) -> di
 
 def _unit_content(note: StructuredNote) -> str:
     parts: list[str] = []
+    if note.faithful_content:
+        parts.append(note.faithful_content)
     if note.summary:
         parts.append(note.summary)
     if note.key_points:

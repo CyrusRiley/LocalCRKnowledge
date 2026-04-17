@@ -6,6 +6,7 @@ NOTE_JSON_FIELDS = """{
   "note_type": "",
   "themes": [],
   "summary": "",
+  "faithful_content": "",
   "key_points": [],
   "usage_scenarios": [],
   "user_insights": "",
@@ -83,6 +84,7 @@ def organize_prompt(
 6. keywords 优先使用简短、稳定、上位的概念词，例如“行为模拟”优先于“行为模拟技术”。
 7. key_points 要合并相近表述，避免把同义句拆成重复要点。
 8. 不确定的字段用空字符串或空数组，不要编造。
+9. faithful_content 要保留当前知识单元的主要信息，用 1-3 段完整句子整理，不要只写短词或标签；它应比 summary 更完整，但不能超出当前片段原文含义。
 
 JSON 模板：
 {NOTE_JSON_FIELDS}

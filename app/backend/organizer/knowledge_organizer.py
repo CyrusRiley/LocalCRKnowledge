@@ -10,7 +10,7 @@ from uuid import uuid4
 
 from app.backend.database.repository import KnowledgeRepository
 from app.backend.preprocess.cleaner import extract_keywords
-from app.backend.relations.relation_builder import build_structural_relations, dedupe_relations
+from app.backend.relations.relation_builder import build_relations_for_notes, build_structural_relations, dedupe_relations
 from app.backend.utils.time_utils import utc_now_iso
 
 
@@ -53,11 +53,16 @@ def organize_knowledge_base(
     *,
     run_id: str,
     logger: Logger,
+    mode: str = "full",
     progress_cb: ProgressCallback | None = None,
 ) -> dict:
     def push(status: str, message: str, percent: int) -> None:
         if progress_cb:
             progress_cb({"status": status, "message": message, "percent": percent})
+
+    normalized_mode = "quick" if mode == "quick" else "full"
+    if normalized_mode == "quick":
+        return _organize_quick(repo, run_id=run_id, logger=logger, progress_cb=progress_cb)
 
     push("running", "Loading notes...", 5)
     notes = repo.list_notes_for_organize()
@@ -103,6 +108,9 @@ def organize_knowledge_base(
                 "from_note_id": dup_id,
                 "to_note_id": keeper_id,
                 "relation_type": "duplicate_of",
+                "relation_layer": "semantic",
+                "relation_strength": "strong",
+                "display_default": True,
                 "score": 1.0,
                 "reason": "high lexical similarity; kept as candidate, not deleted automatically",
                 "created_at": now,
@@ -125,6 +133,9 @@ def organize_knowledge_base(
                 "from_note_id": pair[0],
                 "to_note_id": pair[1],
                 "relation_type": "related_to",
+                "relation_layer": "weak",
+                "relation_strength": "weak",
+                "display_default": False,
                 "score": round(score, 4),
                 "reason": "shared themes/keywords",
                 "created_at": now,
@@ -137,12 +148,17 @@ def organize_knowledge_base(
 
     push("running", "Generating report...", 90)
     stats = {
+        "mode": "full",
         "total_notes_before": len(vectors),
         "total_notes_after": len(vectors),
         "removed_duplicates": 0,
         "duplicate_candidates": len(duplicate_map),
         "duplicate_clusters": sum(1 for values in clusters.values() if len(values) > 1),
         "relations_saved": len(relations),
+        "display_relations": sum(1 for rel in relations if rel.get("display_default")),
+        "structure_relations": sum(1 for rel in relations if rel.get("relation_layer") == "structure"),
+        "semantic_relations": sum(1 for rel in relations if rel.get("relation_layer") == "semantic"),
+        "weak_relations": sum(1 for rel in relations if rel.get("relation_layer") == "weak"),
     }
     report = _build_report(stats, clusters, relations)
     push("completed", "Knowledge organization finished.", 100)
@@ -150,10 +166,113 @@ def organize_knowledge_base(
     return {"stats": stats, "report_markdown": report, "relations": relations}
 
 
+def _organize_quick(
+    repo: KnowledgeRepository,
+    *,
+    run_id: str,
+    logger: Logger,
+    progress_cb: ProgressCallback | None = None,
+) -> dict:
+    def push(status: str, message: str, percent: int) -> None:
+        if progress_cb:
+            progress_cb({"status": status, "message": message, "percent": percent})
+
+    push("running", "Loading previous relation network...", 5)
+    previous_run = repo.get_latest_completed_organize_run()
+    if not previous_run:
+        logger.info("Quick organize falls back to full rebuild: no completed run")
+        result = organize_knowledge_base(repo, run_id=run_id, logger=logger, mode="full", progress_cb=progress_cb)
+        result["stats"]["mode"] = "full"
+        result["stats"]["quick_fallback"] = "no_completed_run"
+        return result
+
+    cutoff = str(previous_run.get("finished_at") or previous_run.get("started_at") or "")
+    affected_notes = repo.list_notes_updated_after(cutoff) if cutoff else repo.list_notes_for_organize()
+    affected_ids = {str(note.get("note_id") or "") for note in affected_notes if note.get("note_id")}
+    previous_relations = repo.list_relations_for_run(str(previous_run["run_id"]), limit=100000)
+
+    push("running", f"Found {len(affected_ids)} changed notes.", 25)
+    if not affected_ids:
+        relations = [_copy_relation(rel) for rel in previous_relations]
+        repo.replace_relations_for_run(run_id, relations)
+        stats = _relation_stats(
+            relations,
+            mode="quick",
+            total_notes=len(repo.list_notes_for_organize()),
+            affected_notes=0,
+            copied_relations=len(relations),
+            rebuilt_relations=0,
+        )
+        report = _build_report(stats, {}, relations)
+        push("completed", "No changed notes; copied current relation network.", 100)
+        return {"stats": stats, "report_markdown": report, "relations": relations}
+
+    push("running", "Keeping unaffected relations...", 40)
+    kept_relations = [
+        _copy_relation(rel)
+        for rel in previous_relations
+        if str(rel.get("from_note_id") or "") not in affected_ids and str(rel.get("to_note_id") or "") not in affected_ids
+    ]
+
+    push("running", "Rebuilding changed note relations...", 60)
+    vectors = [_vectorize(note) for note in repo.list_notes_for_organize()]
+    duplicate_pairs, related_pairs = _find_relations_for_affected(vectors, affected_ids)
+    now = utc_now_iso()
+    rebuilt_relations: list[dict] = []
+    for a, b, score in duplicate_pairs:
+        rebuilt_relations.append(
+            {
+                "relation_id": str(uuid4()),
+                "from_note_id": a,
+                "to_note_id": b,
+                "relation_type": "duplicate_of",
+                "relation_layer": "semantic",
+                "relation_strength": "strong",
+                "display_default": True,
+                "score": round(score, 4),
+                "reason": "high lexical similarity in quick organize",
+                "created_at": now,
+            }
+        )
+    for a, b, score in related_pairs:
+        rebuilt_relations.append(
+            {
+                "relation_id": str(uuid4()),
+                "from_note_id": a,
+                "to_note_id": b,
+                "relation_type": "related_to",
+                "relation_layer": "weak",
+                "relation_strength": "weak",
+                "display_default": False,
+                "score": round(score, 4),
+                "reason": "shared themes/keywords in quick organize",
+                "created_at": now,
+            }
+        )
+    rebuilt_relations.extend(build_relations_for_notes(repo, affected_ids))
+
+    push("running", "Saving merged relation network...", 85)
+    relations = dedupe_relations([*kept_relations, *rebuilt_relations])
+    repo.replace_relations_for_run(run_id, relations)
+    stats = _relation_stats(
+        relations,
+        mode="quick",
+        total_notes=len(vectors),
+        affected_notes=len(affected_ids),
+        copied_relations=len(kept_relations),
+        rebuilt_relations=len(rebuilt_relations),
+    )
+    report = _build_report(stats, {}, relations)
+    push("completed", "Quick relation update finished.", 100)
+    logger.info("Quick organize run %s finished: %s", run_id, stats)
+    return {"stats": stats, "report_markdown": report, "relations": relations}
+
+
 def _vectorize(note: dict) -> NoteVector:
     pieces = [
         str(note.get("title") or ""),
         str(note.get("summary") or ""),
+        str(note.get("faithful_content") or ""),
         str(note.get("source_excerpt") or ""),
         "\n".join(note.get("key_points") or []),
         "\n".join(note.get("usage_scenarios") or []),
@@ -238,6 +357,37 @@ def _find_relations(vectors: list[NoteVector]) -> tuple[list[tuple[str, str, flo
     return duplicate_pairs, related_pairs
 
 
+def _find_relations_for_affected(
+    vectors: list[NoteVector],
+    affected_note_ids: set[str],
+) -> tuple[list[tuple[str, str, float]], list[tuple[str, str, float]]]:
+    affected = [vec for vec in vectors if vec.note_id in affected_note_ids]
+    if not affected:
+        return [], []
+
+    duplicate_pairs: list[tuple[str, str, float]] = []
+    related_pairs: list[tuple[str, str, float]] = []
+    seen: set[tuple[str, str]] = set()
+    for vec in affected:
+        for other in vectors:
+            if vec.note_id == other.note_id:
+                continue
+            pair = tuple(sorted((vec.note_id, other.note_id)))
+            if pair in seen:
+                continue
+            seen.add(pair)
+            shared = len(vec.tokens & other.tokens)
+            if shared < 2 and vec.normalized_text != other.normalized_text:
+                continue
+            jac = _jaccard(vec.tokens, other.tokens)
+            ratio = SequenceMatcher(None, vec.normalized_text, other.normalized_text).ratio()
+            if vec.normalized_text == other.normalized_text or jac >= 0.86 or (jac >= 0.74 and ratio >= 0.90):
+                duplicate_pairs.append((vec.note_id, other.note_id, max(jac, ratio)))
+            elif jac >= 0.38:
+                related_pairs.append((vec.note_id, other.note_id, jac))
+    return duplicate_pairs, related_pairs
+
+
 def _jaccard(a: set[str], b: set[str]) -> float:
     if not a and not b:
         return 1.0
@@ -259,6 +409,48 @@ def _pick_keeper(items: list[NoteVector]) -> str:
     return ranked[0].note_id
 
 
+def _copy_relation(relation: dict) -> dict:
+    return {
+        "relation_id": str(uuid4()),
+        "from_note_id": relation.get("from_note_id"),
+        "to_note_id": relation.get("to_note_id"),
+        "relation_type": relation.get("relation_type"),
+        "relation_layer": relation.get("relation_layer") or "semantic",
+        "relation_strength": relation.get("relation_strength") or "medium",
+        "display_default": bool(relation.get("display_default", True)),
+        "score": float(relation.get("score") or 0.0),
+        "reason": relation.get("reason") or "",
+        "created_at": utc_now_iso(),
+    }
+
+
+def _relation_stats(
+    relations: list[dict],
+    *,
+    mode: str,
+    total_notes: int,
+    affected_notes: int = 0,
+    copied_relations: int = 0,
+    rebuilt_relations: int = 0,
+) -> dict:
+    return {
+        "mode": mode,
+        "total_notes_before": total_notes,
+        "total_notes_after": total_notes,
+        "removed_duplicates": 0,
+        "duplicate_candidates": sum(1 for rel in relations if rel.get("relation_type") == "duplicate_of"),
+        "duplicate_clusters": 0,
+        "affected_notes": affected_notes,
+        "copied_relations": copied_relations,
+        "rebuilt_relations": rebuilt_relations,
+        "relations_saved": len(relations),
+        "display_relations": sum(1 for rel in relations if rel.get("display_default")),
+        "structure_relations": sum(1 for rel in relations if rel.get("relation_layer") == "structure"),
+        "semantic_relations": sum(1 for rel in relations if rel.get("relation_layer") == "semantic"),
+        "weak_relations": sum(1 for rel in relations if rel.get("relation_layer") == "weak"),
+    }
+
+
 def _build_report(stats: dict, clusters: dict[str, list[str]] | list, relations: list[dict]) -> str:
     duplicate_examples: list[str] = []
     if isinstance(clusters, dict):
@@ -277,12 +469,20 @@ def _build_report(stats: dict, clusters: dict[str, list[str]] | list, relations:
         "# 知识库整理报告",
         "",
         "## 统计信息",
+        f"- 整理模式: {stats.get('mode', 'full')}",
         f"- 整理前条目数: {stats.get('total_notes_before', 0)}",
         f"- 整理后条目数: {stats.get('total_notes_after', 0)}",
+        f"- 快速整理受影响条目数: {stats.get('affected_notes', 0)}",
+        f"- 沿用旧关系数量: {stats.get('copied_relations', 0)}",
+        f"- 重建关系候选数量: {stats.get('rebuilt_relations', 0)}",
         f"- 自动删除条目数: {stats.get('removed_duplicates', 0)}",
         f"- 重复候选条目数: {stats.get('duplicate_candidates', 0)}",
         f"- 发现重复簇数量: {stats.get('duplicate_clusters', 0)}",
         f"- 保存关系数量: {stats.get('relations_saved', 0)}",
+        f"- 默认展示关系数量: {stats.get('display_relations', 0)}",
+        f"- 结构边数量: {stats.get('structure_relations', 0)}",
+        f"- 语义边数量: {stats.get('semantic_relations', 0)}",
+        f"- 弱关系数量: {stats.get('weak_relations', 0)}",
         "",
         "## 重复簇示例",
     ]

@@ -63,6 +63,12 @@
             <button id="btn-import-dir">增量更新</button>
           </div>
         </div>
+        <div id="import-progress" class="import-progress hidden" aria-live="polite">
+          <div class="progress-track">
+            <span class="progress-bar"></span>
+          </div>
+          <span id="import-progress-text">等待开始</span>
+        </div>
         <pre id="import-log" class="log-box"></pre>
       </section>
 
@@ -87,14 +93,15 @@
         <div class="panel-title">
           <h2>知识库</h2>
           <div class="panel-actions">
-            <button id="btn-organize-library" class="primary">整理知识库</button>
+            <button id="btn-organize-quick" class="primary">快速整理</button>
+            <button id="btn-organize-full">全局整理</button>
             <button id="btn-refresh-network">刷新网络</button>
           </div>
         </div>
         <div id="organize-status" class="organize-status">尚未运行知识库整理任务。</div>
         <div class="network-toolbar">
-          <input id="network-limit" type="number" min="10" max="200" value="80" />
-          <span>显示最近知识条与最新整理关系。</span>
+          <input id="network-limit" type="number" min="20" max="300" value="120" />
+          <span>显示主题、概念、知识组、知识条与强语义关系。</span>
         </div>
         <div class="network-grid">
           <section class="network-panel">
@@ -106,6 +113,14 @@
             <ul id="relation-list" class="relation-list"></ul>
           </section>
         </div>
+        <section class="history-panel">
+          <div class="history-title">
+            <h3>入库历史</h3>
+            <button id="btn-refresh-history">刷新历史</button>
+          </div>
+          <div id="history-summary" class="history-summary">等待加载入库历史。</div>
+          <ul id="history-list" class="history-list"></ul>
+        </section>
       </section>
 
       <section class="tab-panel" id="tab-qa">

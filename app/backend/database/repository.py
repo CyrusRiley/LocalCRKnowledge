@@ -76,10 +76,10 @@ class KnowledgeRepository:
             self.conn.execute(
                 """
                 INSERT INTO notes_structured (
-                  note_id, source_id, title, note_type, themes_json, summary,
+                  note_id, source_id, title, note_type, themes_json, summary, faithful_content,
                   key_points_json, usage_scenarios_json, user_insights, keywords_json,
                   source_excerpt, markdown_content, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     note.note_id,
@@ -88,6 +88,7 @@ class KnowledgeRepository:
                     note.note_type,
                     _json(note.themes),
                     note.summary,
+                    note.faithful_content,
                     _json(note.key_points),
                     _json(note.usage_scenarios),
                     note.user_insights,
@@ -150,6 +151,35 @@ class KnowledgeRepository:
         ).fetchall()
         return [_note_dict(row) for row in rows]
 
+    def list_import_history(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            SELECT
+              s.source_id,
+              s.source_type,
+              s.file_path,
+              s.created_at,
+              s.imported_at,
+              s.status,
+              COUNT(n.note_id) AS note_count,
+              MAX(n.updated_at) AS latest_note_at,
+              GROUP_CONCAT(n.title, '||') AS note_titles
+            FROM sources s
+            LEFT JOIN notes_structured n ON n.source_id = s.source_id
+            GROUP BY s.source_id
+            ORDER BY s.imported_at DESC, latest_note_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        history: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["note_count"] = int(item.get("note_count") or 0)
+            item["note_titles"] = [part for part in str(item.get("note_titles") or "").split("||") if part][:8]
+            history.append(item)
+        return history
+
     def get_note(self, note_id: str) -> dict[str, Any] | None:
         row = self.conn.execute(
             """
@@ -187,6 +217,19 @@ class KnowledgeRepository:
         ).fetchall()
         return [_note_dict(row) for row in rows]
 
+    def list_notes_updated_after(self, cutoff: str, *, limit: int = 10000) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            SELECT *
+            FROM notes_structured
+            WHERE updated_at > ?
+            ORDER BY updated_at DESC
+            LIMIT ?
+            """,
+            (cutoff, limit),
+        ).fetchall()
+        return [_note_dict(row) for row in rows]
+
     def delete_note(self, note_id: str) -> None:
         with self.conn:
             self.conn.execute("DELETE FROM fts_notes WHERE note_id = ?", (note_id,))
@@ -200,6 +243,7 @@ class KnowledgeRepository:
         note_type: str,
         themes: list[str],
         summary: str,
+        faithful_content: str,
         key_points: list[str],
         usage_scenarios: list[str],
         user_insights: str,
@@ -217,6 +261,7 @@ class KnowledgeRepository:
                   note_type = ?,
                   themes_json = ?,
                   summary = ?,
+                  faithful_content = ?,
                   key_points_json = ?,
                   usage_scenarios_json = ?,
                   user_insights = ?,
@@ -231,6 +276,7 @@ class KnowledgeRepository:
                     note_type,
                     _json(themes),
                     summary,
+                    faithful_content,
                     _json(key_points),
                     _json(usage_scenarios),
                     user_insights,
@@ -349,7 +395,8 @@ class KnowledgeRepository:
             """
             SELECT
               u.*, g.group_title, n.updated_at AS note_updated_at,
-              n.summary AS note_summary, n.themes_json, n.keywords_json
+              n.summary AS note_summary, n.faithful_content AS note_faithful_content,
+              n.themes_json, n.keywords_json
             FROM knowledge_units u
             LEFT JOIN knowledge_groups g ON g.group_id = u.group_id
             LEFT JOIN notes_structured n ON n.note_id = u.note_id
@@ -365,6 +412,52 @@ class KnowledgeRepository:
             item["keywords"] = _loads(item.pop("keywords_json", None))
             data.append(item)
         return data
+
+    def list_units_for_graph(self, *, limit: int = 120) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            SELECT
+              u.*, g.group_title, g.group_type, n.title AS note_title, n.note_type AS note_note_type,
+              n.summary AS note_summary, n.faithful_content AS note_faithful_content,
+              n.themes_json, n.keywords_json, n.updated_at AS note_updated_at,
+              s.file_path, s.imported_at
+            FROM knowledge_units u
+            LEFT JOIN knowledge_groups g ON g.group_id = u.group_id
+            LEFT JOIN notes_structured n ON n.note_id = u.note_id
+            LEFT JOIN sources s ON s.source_id = u.source_id
+            WHERE u.note_id IS NOT NULL
+            ORDER BY n.updated_at DESC, u.updated_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        data: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["attributes"] = _loads(item.pop("attributes_json", None))
+            item["themes"] = _loads(item.pop("themes_json", None))
+            item["keywords"] = _loads(item.pop("keywords_json", None))
+            data.append(item)
+        return data
+
+    def list_keyword_links_for_units(self, unit_ids: list[str]) -> list[dict[str, Any]]:
+        ids = [unit_id for unit_id in unit_ids if unit_id]
+        if not ids:
+            return []
+        placeholders = ",".join("?" for _ in ids)
+        rows = self.conn.execute(
+            f"""
+            SELECT
+              uk.unit_id, uk.term_id, uk.confidence, uk.matched_by,
+              t.canonical_name, t.normalized_name
+            FROM unit_keywords uk
+            JOIN keyword_terms t ON t.term_id = uk.term_id
+            WHERE uk.unit_id IN ({placeholders})
+            ORDER BY t.canonical_name, uk.confidence DESC
+            """,
+            tuple(ids),
+        ).fetchall()
+        return [dict(row) for row in rows]
 
     def list_unit_keyword_links(self) -> list[dict[str, Any]]:
         rows = self.conn.execute(
@@ -558,11 +651,12 @@ class KnowledgeRepository:
             SELECT DISTINCT
               n.*, s.file_path, s.imported_at,
               40.0 AS score,
-              'same_group:' || COALESCE(g.group_title, '') AS snippet
+              'near_group:' || COALESCE(g.group_title, '') AS snippet
             FROM knowledge_units seed
             JOIN knowledge_units peer ON peer.group_id = seed.group_id
               AND peer.note_id IS NOT NULL
               AND peer.note_id != seed.note_id
+              AND ABS(peer.order_index - seed.order_index) <= 2
             JOIN notes_structured n ON n.note_id = peer.note_id
             LEFT JOIN knowledge_groups g ON g.group_id = peer.group_id
             LEFT JOIN sources s ON s.source_id = n.source_id
@@ -582,14 +676,29 @@ class KnowledgeRepository:
         placeholders = ",".join("?" for _ in normalized_ids)
         rows = self.conn.execute(
             f"""
-            WITH peers AS (
+            WITH latest_run AS (
+              SELECT run_id
+              FROM organize_runs
+              WHERE status = 'completed'
+              ORDER BY finished_at DESC, started_at DESC
+              LIMIT 1
+            ),
+            peers AS (
               SELECT to_note_id AS note_id, relation_type, score AS rel_score
               FROM knowledge_relations
               WHERE from_note_id IN ({placeholders})
+                AND run_id = (SELECT run_id FROM latest_run)
+                AND display_default = 1
+                AND relation_layer IN ('semantic', 'structure')
+                AND relation_strength IN ('strong', 'medium')
               UNION ALL
               SELECT from_note_id AS note_id, relation_type, score AS rel_score
               FROM knowledge_relations
               WHERE to_note_id IN ({placeholders})
+                AND run_id = (SELECT run_id FROM latest_run)
+                AND display_default = 1
+                AND relation_layer IN ('semantic', 'structure')
+                AND relation_strength IN ('strong', 'medium')
             )
             SELECT DISTINCT
               n.*, s.file_path, s.imported_at,
@@ -752,6 +861,20 @@ class KnowledgeRepository:
             return None
         return _organize_run_dict(row)
 
+    def get_latest_completed_organize_run(self) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            """
+            SELECT *
+            FROM organize_runs
+            WHERE status = 'completed'
+            ORDER BY finished_at DESC, started_at DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        if not row:
+            return None
+        return _organize_run_dict(row)
+
     def replace_relations_for_run(self, run_id: str, relations: list[dict[str, Any]]) -> None:
         with self.conn:
             self.conn.execute("DELETE FROM knowledge_relations WHERE run_id = ?", (run_id,))
@@ -759,8 +882,9 @@ class KnowledgeRepository:
                 self.conn.execute(
                     """
                     INSERT INTO knowledge_relations (
-                      relation_id, run_id, from_note_id, to_note_id, relation_type, score, reason, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                      relation_id, run_id, from_note_id, to_note_id, relation_type,
+                      relation_layer, relation_strength, display_default, score, reason, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         rel["relation_id"],
@@ -768,11 +892,19 @@ class KnowledgeRepository:
                         rel["from_note_id"],
                         rel["to_note_id"],
                         rel["relation_type"],
+                        rel.get("relation_layer") or "semantic",
+                        rel.get("relation_strength") or "medium",
+                        1 if rel.get("display_default", True) else 0,
                         float(rel.get("score", 0.0)),
                         rel.get("reason"),
                         rel["created_at"],
                     ),
                 )
+
+    def delete_relations_except_run(self, run_id: str) -> int:
+        with self.conn:
+            cur = self.conn.execute("DELETE FROM knowledge_relations WHERE run_id != ?", (run_id,))
+            return int(cur.rowcount or 0)
 
     def list_relations_for_run(self, run_id: str, *, limit: int = 300) -> list[dict[str, Any]]:
         rows = self.conn.execute(
@@ -780,12 +912,50 @@ class KnowledgeRepository:
             SELECT *
             FROM knowledge_relations
             WHERE run_id = ?
-            ORDER BY score DESC, created_at DESC
+            ORDER BY display_default DESC, score DESC, created_at DESC
             LIMIT ?
             """,
             (run_id, limit),
         ).fetchall()
         return [dict(row) for row in rows]
+
+    def list_relations_for_latest_completed_run(self, *, limit: int = 100000) -> list[dict[str, Any]]:
+        run = self.get_latest_completed_organize_run()
+        if not run:
+            return []
+        return self.list_relations_for_run(str(run["run_id"]), limit=limit)
+
+    def list_display_relations_for_latest_run(self, *, limit: int = 300) -> list[dict[str, Any]]:
+        row = self.conn.execute(
+            """
+            SELECT run_id
+            FROM organize_runs
+            WHERE status = 'completed'
+            ORDER BY started_at DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        if not row:
+            return []
+        rows = self.conn.execute(
+            """
+            SELECT *
+            FROM knowledge_relations
+            WHERE run_id = ?
+              AND display_default = 1
+            ORDER BY
+              CASE relation_strength
+                WHEN 'strong' THEN 0
+                WHEN 'medium' THEN 1
+                ELSE 2
+              END,
+              score DESC,
+              created_at DESC
+            LIMIT ?
+            """,
+            (row["run_id"], limit),
+        ).fetchall()
+        return [dict(item) for item in rows]
 
     def _like_search(
         self,
@@ -802,11 +972,11 @@ class KnowledgeRepository:
         params: list[Any] = []
         for term in terms[:48]:
             text_filters.append(
-                "(n.title LIKE ? OR n.summary LIKE ? OR n.markdown_content LIKE ? "
+                "(n.title LIKE ? OR n.summary LIKE ? OR n.faithful_content LIKE ? OR n.markdown_content LIKE ? "
                 "OR n.source_excerpt LIKE ? OR n.themes_json LIKE ? OR n.keywords_json LIKE ?)"
             )
             like = f"%{term}%"
-            params.extend([like, like, like, like, like, like])
+            params.extend([like, like, like, like, like, like, like])
         filters = [f"({' OR '.join(text_filters)})"]
         if theme:
             filters.append("n.themes_json LIKE ?")
@@ -839,9 +1009,9 @@ class KnowledgeRepository:
             (
                 note.note_id,
                 note.title,
-                note.summary,
+                _join_text(note.summary, note.faithful_content),
                 "\n".join(note.key_points),
-                note.markdown_content,
+                _join_text(note.markdown_content, note.faithful_content),
                 note.source_excerpt,
                 " ".join(note.themes),
                 " ".join(note.keywords),
@@ -851,7 +1021,8 @@ class KnowledgeRepository:
     def _refresh_fts_by_note_id(self, note_id: str) -> None:
         row = self.conn.execute(
             """
-            SELECT note_id, title, summary, key_points_json, markdown_content, source_excerpt, themes_json, keywords_json
+            SELECT note_id, title, summary, faithful_content, key_points_json, markdown_content,
+                   source_excerpt, themes_json, keywords_json
             FROM notes_structured
             WHERE note_id = ?
             """,
@@ -869,9 +1040,9 @@ class KnowledgeRepository:
             (
                 row["note_id"],
                 row["title"] or "",
-                row["summary"] or "",
+                _join_text(row["summary"], row["faithful_content"]),
                 "\n".join(_loads(row["key_points_json"])),
-                row["markdown_content"] or "",
+                _join_text(row["markdown_content"], row["faithful_content"]),
                 row["source_excerpt"] or "",
                 " ".join(_loads(row["themes_json"])),
                 " ".join(_loads(row["keywords_json"])),
@@ -881,6 +1052,15 @@ class KnowledgeRepository:
 
 def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False)
+
+
+def _join_text(*values: Any) -> str:
+    parts: list[str] = []
+    for value in values:
+        text = str(value or "").strip()
+        if text and text not in parts:
+            parts.append(text)
+    return "\n".join(parts)
 
 
 def _loads(value: str | None) -> Any:

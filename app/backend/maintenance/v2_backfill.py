@@ -65,6 +65,7 @@ def backfill_v2_structures(repo: KnowledgeRepository, logger: Logger | None = No
                 confidence=0.6,
                 attributes={
                     "themes": note.get("themes") or [],
+                    "faithful_content": str(note.get("faithful_content") or "")[:1200],
                     "key_points": note.get("key_points") or [],
                     "usage_scenarios": note.get("usage_scenarios") or [],
                     "backfilled_keywords": keywords,
@@ -84,6 +85,8 @@ def backfill_v2_structures(repo: KnowledgeRepository, logger: Logger | None = No
 
 def _unit_content(note: dict) -> str:
     parts: list[str] = []
+    if note.get("faithful_content"):
+        parts.append(str(note["faithful_content"]))
     if note.get("summary"):
         parts.append(str(note["summary"]))
     for item in note.get("key_points") or []:
@@ -91,4 +94,3 @@ def _unit_content(note: dict) -> str:
     if note.get("user_insights"):
         parts.append(str(note["user_insights"]))
     return "\n".join(parts).strip() or str(note.get("source_excerpt") or note.get("markdown_content") or "")
-

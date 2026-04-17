@@ -10,6 +10,7 @@ REQUIRED_NOTE_FIELDS = {
     "note_type": "",
     "themes": [],
     "summary": "",
+    "faithful_content": "",
     "key_points": [],
     "usage_scenarios": [],
     "user_insights": "",
@@ -81,6 +82,7 @@ def normalize_note_payload(data: dict[str, Any], *, fallback_title: str, source_
     normalized["usage_scenarios"] = _string_list(normalized["usage_scenarios"])
     normalized["keywords"] = _string_list(normalized["keywords"])
     normalized["summary"] = str(normalized["summary"] or _summary_fallback(source_text))
+    normalized["faithful_content"] = str(normalized["faithful_content"] or source_text[:1200])
     normalized["user_insights"] = str(normalized["user_insights"] or "")
     normalized["source_excerpt"] = str(normalized["source_excerpt"] or source_text[:300])
     return normalized

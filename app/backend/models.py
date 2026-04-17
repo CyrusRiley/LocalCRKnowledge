@@ -25,6 +25,7 @@ class StructuredNote:
     note_type: str
     themes: list[str] = field(default_factory=list)
     summary: str = ""
+    faithful_content: str = ""
     key_points: list[str] = field(default_factory=list)
     usage_scenarios: list[str] = field(default_factory=list)
     user_insights: str = ""
@@ -52,6 +53,13 @@ class StructuredNote:
             note_type=str(payload.get("note_type") or "未分类"),
             themes=_string_list(payload.get("themes")),
             summary=str(payload.get("summary") or ""),
+            faithful_content=str(
+                payload.get("faithful_content")
+                or payload.get("full_content")
+                or payload.get("content")
+                or payload.get("summary")
+                or ""
+            ),
             key_points=_string_list(payload.get("key_points")),
             usage_scenarios=_string_list(payload.get("usage_scenarios")),
             user_insights=str(payload.get("user_insights") or ""),

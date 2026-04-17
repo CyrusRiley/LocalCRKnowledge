@@ -23,6 +23,7 @@ from app.backend.llm.client import QwenClient
 from app.backend.maintenance.v2_backfill import backfill_v2_structures
 from app.backend.organizer.knowledge_organizer import organize_knowledge_base
 from app.backend.retrieval.answer_builder import build_answer_result
+from app.backend.retrieval.graph_builder import build_library_graph
 from app.backend.retrieval.search_service import SearchService
 from app.backend.updater.incremental_updater import IncrementalUpdater
 from app.backend.utils.logger import setup_logger
@@ -195,6 +196,40 @@ class RequestHandler(BaseHTTPRequestHandler):
                         return
                     relations = ctx.repo.list_relations_for_run(run["run_id"], limit=120)
                     self._json_response(HTTPStatus.OK, {"run": run, "relations": relations})
+                finally:
+                    ctx.close()
+                return
+
+            if parsed.path == "/api/library/graph":
+                params = parse_qs(parsed.query)
+                limit = _to_int(params.get("limit", ["120"])[0], default=120, min_value=20, max_value=300)
+                ctx = ServiceContext.from_runtime(self.runtime)
+                try:
+                    graph = build_library_graph(ctx.repo, limit=limit)
+                    latest = ctx.repo.get_latest_organize_run()
+                    self._json_response(HTTPStatus.OK, {"graph": graph, "run": latest})
+                finally:
+                    ctx.close()
+                return
+
+            if parsed.path == "/api/library/history":
+                params = parse_qs(parsed.query)
+                limit = _to_int(params.get("limit", ["50"])[0], default=50, min_value=1, max_value=200)
+                ctx = ServiceContext.from_runtime(self.runtime)
+                try:
+                    history = ctx.repo.list_import_history(limit=limit)
+                    total_sources = len(history)
+                    total_notes = sum(int(item.get("note_count") or 0) for item in history)
+                    self._json_response(
+                        HTTPStatus.OK,
+                        {
+                            "history": history,
+                            "summary": {
+                                "sources": total_sources,
+                                "notes": total_notes,
+                            },
+                        },
+                    )
                 finally:
                     ctx.close()
                 return
@@ -382,6 +417,10 @@ class RequestHandler(BaseHTTPRequestHandler):
                 return
 
             if parsed.path == "/api/library/organize/start":
+                mode = str(payload.get("mode") or "quick").strip().lower()
+                if mode not in {"quick", "full"}:
+                    self._json_response(HTTPStatus.BAD_REQUEST, {"error": "mode must be quick or full"})
+                    return
                 ctx = ServiceContext.from_runtime(self.runtime)
                 try:
                     with self.runtime.organize_lock:
@@ -404,17 +443,18 @@ class RequestHandler(BaseHTTPRequestHandler):
                     with self.runtime.organize_lock:
                         self.runtime.organize_jobs[run_id] = {
                             "status": "running",
-                            "message": "Job started",
+                            "message": f"{mode} job started",
                             "percent": 1,
+                            "mode": mode,
                             "started_at": started_at,
                         }
                     worker = threading.Thread(
                         target=_run_organize_job,
-                        args=(self.runtime, run_id),
+                        args=(self.runtime, run_id, mode),
                         daemon=True,
                     )
                     worker.start()
-                    self._json_response(HTTPStatus.OK, {"status": "running", "run_id": run_id})
+                    self._json_response(HTTPStatus.OK, {"status": "running", "run_id": run_id, "mode": mode})
                 finally:
                     ctx.close()
                 return
@@ -449,6 +489,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                         note_type=normalized["note_type"],
                         themes=normalized["themes"],
                         summary=normalized["summary"],
+                        faithful_content=normalized["faithful_content"],
                         key_points=normalized["key_points"],
                         usage_scenarios=normalized["usage_scenarios"],
                         user_insights=normalized["user_insights"],
@@ -468,6 +509,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                         note_type=normalized["note_type"],
                         attributes={
                             "themes": normalized["themes"],
+                            "faithful_content": normalized["faithful_content"][:1200],
                             "key_points": normalized["key_points"],
                             "usage_scenarios": normalized["usage_scenarios"],
                             "user_insights": normalized["user_insights"],
@@ -623,6 +665,9 @@ def _normalize_note_payload(payload: dict, existing: dict) -> dict:
         "note_type": str(payload.get("note_type") or existing.get("note_type") or "未分类").strip(),
         "themes": _split_csv(payload.get("themes") if "themes" in payload else existing.get("themes")),
         "summary": str(payload.get("summary") if "summary" in payload else existing.get("summary") or "").strip(),
+        "faithful_content": str(
+            payload.get("faithful_content") if "faithful_content" in payload else existing.get("faithful_content") or ""
+        ).strip(),
         "key_points": _split_lines(payload.get("key_points") if "key_points" in payload else existing.get("key_points")),
         "usage_scenarios": _split_lines(
             payload.get("usage_scenarios") if "usage_scenarios" in payload else existing.get("usage_scenarios")
@@ -639,6 +684,8 @@ def _normalize_note_payload(payload: dict, existing: dict) -> dict:
 
 def _unit_content_from_payload(payload: dict) -> str:
     parts: list[str] = []
+    if payload.get("faithful_content"):
+        parts.append(str(payload["faithful_content"]))
     if payload.get("summary"):
         parts.append(str(payload["summary"]))
     for item in payload.get("key_points") or []:
@@ -648,13 +695,14 @@ def _unit_content_from_payload(payload: dict) -> str:
     return "\n".join(parts).strip() or str(payload.get("source_excerpt") or "")
 
 
-def _run_organize_job(runtime: Runtime, run_id: str) -> None:
+def _run_organize_job(runtime: Runtime, run_id: str, mode: str = "quick") -> None:
     def set_live(status: str, message: str, percent: int) -> None:
         with runtime.organize_lock:
             runtime.organize_jobs[run_id] = {
                 "status": status,
                 "message": message,
                 "percent": percent,
+                "mode": mode,
                 "updated_at": utc_now_iso(),
             }
 
@@ -667,6 +715,7 @@ def _run_organize_job(runtime: Runtime, run_id: str) -> None:
             repo,
             run_id=run_id,
             logger=logger,
+            mode=mode,
             progress_cb=lambda item: set_live(
                 str(item.get("status") or "running"),
                 str(item.get("message") or ""),
@@ -681,6 +730,7 @@ def _run_organize_job(runtime: Runtime, run_id: str) -> None:
             report_markdown=result.get("report_markdown") or "",
             error_message=None,
         )
+        repo.delete_relations_except_run(run_id)
         set_live("completed", "Knowledge organization finished", 100)
     except Exception as exc:  # noqa: BLE001
         logger.exception("Organize run failed: %s", exc)

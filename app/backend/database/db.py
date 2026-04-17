@@ -22,7 +22,22 @@ def init_db(conn: sqlite3.Connection, schema_path: Path | None = None) -> None:
     if schema_path is None:
         schema_path = Path(__file__).with_name("schema.sql")
     conn.executescript(schema_path.read_text(encoding="utf-8"))
+    _run_migrations(conn)
     conn.commit()
+
+
+def _run_migrations(conn: sqlite3.Connection) -> None:
+    _ensure_column(conn, "notes_structured", "faithful_content", "TEXT")
+    _ensure_column(conn, "knowledge_relations", "relation_layer", "TEXT NOT NULL DEFAULT 'semantic'")
+    _ensure_column(conn, "knowledge_relations", "relation_strength", "TEXT NOT NULL DEFAULT 'medium'")
+    _ensure_column(conn, "knowledge_relations", "display_default", "INTEGER NOT NULL DEFAULT 1")
+
+
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    if any(row["name"] == column for row in rows):
+        return
+    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 def _usable_db_path(db_path: Path) -> Path:

@@ -6,6 +6,9 @@ const state = {
   organizePollTimer: null,
   notes: [],
   relations: [],
+  graphNodes: [],
+  graphEdges: [],
+  history: [],
 };
 
 const els = {
@@ -15,6 +18,8 @@ const els = {
   direction: document.getElementById("direction-select"),
   rawText: document.getElementById("raw-text"),
   importLog: document.getElementById("import-log"),
+  importProgress: document.getElementById("import-progress"),
+  importProgressText: document.getElementById("import-progress-text"),
   fileInput: document.getElementById("file-input"),
   filePath: document.getElementById("file-path"),
   dirPath: document.getElementById("dir-path"),
@@ -25,6 +30,8 @@ const els = {
   networkSummary: document.getElementById("network-summary"),
   graph: document.getElementById("knowledge-graph"),
   relationList: document.getElementById("relation-list"),
+  historySummary: document.getElementById("history-summary"),
+  historyList: document.getElementById("history-list"),
   keywordQuery: document.getElementById("keyword-query"),
   questionQuery: document.getElementById("question-query"),
   searchResultList: document.getElementById("search-result-list"),
@@ -38,6 +45,7 @@ function init() {
   bindEvents();
   refreshHealth();
   refreshNetwork();
+  refreshKnowledgeHistory();
   loadLatestOrganizeRun();
 }
 
@@ -51,7 +59,9 @@ function bindEvents() {
   document.getElementById("btn-import-file-path").addEventListener("click", importFileByPath);
   document.getElementById("btn-import-dir").addEventListener("click", importDirectory);
   document.getElementById("btn-refresh-network").addEventListener("click", refreshNetwork);
-  document.getElementById("btn-organize-library").addEventListener("click", startOrganizeLibrary);
+  document.getElementById("btn-refresh-history").addEventListener("click", refreshKnowledgeHistory);
+  document.getElementById("btn-organize-quick").addEventListener("click", () => startOrganizeLibrary("quick"));
+  document.getElementById("btn-organize-full").addEventListener("click", () => startOrganizeLibrary("full"));
   document.getElementById("btn-keyword-search").addEventListener("click", keywordSearch);
   document.getElementById("btn-ask").addEventListener("click", askQuestion);
   document.getElementById("btn-export-current").addEventListener("click", exportCurrentMarkdown);
@@ -69,6 +79,7 @@ async function loadLatestOrganizeRun() {
     const stats = run.stats || {};
     els.organizeStatus.textContent = [
       `最近任务: ${run.status}`,
+      stats.mode ? `模式: ${stats.mode}` : "",
       `开始: ${run.started_at || ""}`,
       stats.total_notes_before !== undefined
         ? `前后条目: ${stats.total_notes_before} -> ${stats.total_notes_after}`
@@ -105,20 +116,25 @@ async function importText() {
     return;
   }
   appendImportLog("正在调用后端整理文本...");
+  setImportProgress(true, "正在整理并写入知识库...", 20);
   try {
     const data = await apiPost("/api/import/text", {
       text,
       direction: els.direction.value,
       export: false,
     });
+    setImportProgress(true, "整理完成，正在刷新知识网络...", 88);
     appendImportLog(JSON.stringify(data, null, 2));
     if (data.markdown) {
       updateResultView(text, data.markdown);
       switchTab("result");
     }
     refreshNetwork();
+    refreshKnowledgeHistory();
   } catch (err) {
     appendImportLog(`整理失败：${err.message}`);
+  } finally {
+    setImportProgress(false, "整理完成", 100);
   }
 }
 
@@ -129,26 +145,33 @@ async function importFiles() {
     return;
   }
   appendImportLog(`正在处理 ${files.length} 个上传文件...`);
+  setImportProgress(true, `正在读取 ${files.length} 个文件...`, 8);
   try {
     const payloadFiles = [];
     for (const file of files) {
       const content = await file.text();
       payloadFiles.push({ name: file.name, content });
+      setImportProgress(true, `已读取 ${payloadFiles.length}/${files.length} 个文件...`, Math.round((payloadFiles.length / files.length) * 35));
     }
+    setImportProgress(true, `正在整理并写入 ${files.length} 个文件...`, 45);
     const data = await apiPost("/api/import/files", {
       files: payloadFiles,
       direction: els.direction.value,
       export: false,
     });
     appendImportLog(JSON.stringify(data, null, 2));
+    setImportProgress(true, "导入完成，正在刷新知识网络...", 88);
     const lastSuccess = (data.results || []).find((item) => item.markdown);
     if (lastSuccess && lastSuccess.markdown) {
       updateResultView("", lastSuccess.markdown);
       switchTab("result");
     }
     refreshNetwork();
+    refreshKnowledgeHistory();
   } catch (err) {
     appendImportLog(`文件导入失败：${err.message}`);
+  } finally {
+    setImportProgress(false, "导入完成", 100);
   }
 }
 
@@ -159,20 +182,25 @@ async function importFileByPath() {
     return;
   }
   appendImportLog(`正在导入文件：${path}`);
+  setImportProgress(true, "正在导入本地文件...", 25);
   try {
     const data = await apiPost("/api/import/file-path", {
       path,
       direction: els.direction.value,
       export: false,
     });
+    setImportProgress(true, "导入完成，正在刷新知识网络...", 88);
     appendImportLog(JSON.stringify(data, null, 2));
     if (data.markdown) {
       updateResultView("", data.markdown);
       switchTab("result");
     }
     refreshNetwork();
+    refreshKnowledgeHistory();
   } catch (err) {
     appendImportLog(`路径导入失败：${err.message}`);
+  } finally {
+    setImportProgress(false, "导入完成", 100);
   }
 }
 
@@ -183,25 +211,35 @@ async function importDirectory() {
     return;
   }
   appendImportLog(`正在增量扫描目录：${path}`);
+  setImportProgress(true, "正在扫描目录并增量入库...", 25);
   try {
     const data = await apiPost("/api/import/dir", {
       path,
       direction: els.direction.value,
       recursive: true,
     });
+    setImportProgress(true, "增量更新完成，正在刷新知识网络...", 88);
     appendImportLog(JSON.stringify(data, null, 2));
     refreshNetwork();
+    refreshKnowledgeHistory();
   } catch (err) {
     appendImportLog(`目录增量失败：${err.message}`);
+  } finally {
+    setImportProgress(false, "增量更新完成", 100);
   }
 }
 
-async function startOrganizeLibrary() {
+async function startOrganizeLibrary(mode = "quick") {
+  const normalizedMode = mode === "full" ? "full" : "quick";
+  if (normalizedMode === "full") {
+    const ok = confirm("全局整理会从头重建全部知识关系，耗时会更久。确定要继续吗？");
+    if (!ok) return;
+  }
   try {
-    els.organizeStatus.textContent = "正在启动知识库整理任务...";
-    const data = await apiPost("/api/library/organize/start", {});
+    els.organizeStatus.textContent = normalizedMode === "full" ? "正在启动全局整理任务..." : "正在启动快速整理任务...";
+    const data = await apiPost("/api/library/organize/start", { mode: normalizedMode });
     state.organizeRunId = data.run_id || "";
-    els.organizeStatus.textContent = `整理任务已启动: ${state.organizeRunId}`;
+    els.organizeStatus.textContent = `${normalizedMode === "full" ? "全局整理" : "快速整理"}任务已启动: ${state.organizeRunId}`;
     startOrganizePolling();
   } catch (err) {
     els.organizeStatus.textContent = `启动失败：${err.message}`;
@@ -221,7 +259,8 @@ function startOrganizePolling() {
       const status = live.status || run.status || "running";
       const percent = Number(live.percent || 0);
       const msg = live.message || "";
-      els.organizeStatus.textContent = `整理中(${status}) ${percent}% ${msg}`;
+      const mode = live.mode || (run.stats && run.stats.mode) || "";
+      els.organizeStatus.textContent = `整理中(${status}${mode ? `/${mode}` : ""}) ${percent}% ${msg}`;
       if (status === "completed" || status === "failed") {
         clearInterval(state.organizePollTimer);
         state.organizePollTimer = null;
@@ -237,15 +276,13 @@ function startOrganizePolling() {
 }
 
 async function refreshNetwork() {
-  const limit = Math.max(10, Math.min(200, Number(els.networkLimit.value || "80")));
+  const limit = Math.max(20, Math.min(300, Number(els.networkLimit.value || "120")));
   try {
-    const [notesData, organizeData] = await Promise.all([
-      apiGet(`/api/notes?limit=${limit}`),
-      apiGet("/api/library/organize/latest"),
-    ]);
-    state.notes = notesData.notes || [];
-    state.relations = organizeData.relations || [];
-    renderKnowledgeNetwork(state.notes, state.relations, organizeData.run || null);
+    const data = await apiGet(`/api/library/graph?limit=${limit}`);
+    const graph = data.graph || {};
+    state.graphNodes = graph.nodes || [];
+    state.graphEdges = graph.edges || [];
+    renderKnowledgeNetwork(graph, data.run || null);
   } catch (err) {
     els.networkSummary.textContent = `网络加载失败：${err.message}`;
     els.graph.innerHTML = "";
@@ -253,25 +290,57 @@ async function refreshNetwork() {
   }
 }
 
-function renderKnowledgeNetwork(notes, relations, run) {
-  const noteMap = new Map(notes.map((note) => [note.note_id, note]));
-  const relationNodes = new Set();
-  relations.forEach((rel) => {
-    relationNodes.add(rel.from_note_id);
-    relationNodes.add(rel.to_note_id);
-  });
-  const nodes = notes
-    .filter((note) => relationNodes.size === 0 || relationNodes.has(note.note_id))
-    .slice(0, 48);
-  const visible = new Set(nodes.map((note) => note.note_id));
-  const edges = relations
-    .filter((rel) => visible.has(rel.from_note_id) && visible.has(rel.to_note_id))
-    .slice(0, 140);
+async function refreshKnowledgeHistory() {
+  if (!els.historyList || !els.historySummary) return;
+  try {
+    const data = await apiGet("/api/library/history?limit=80");
+    state.history = data.history || [];
+    renderKnowledgeHistory(state.history, data.summary || {});
+  } catch (err) {
+    els.historySummary.textContent = `入库历史加载失败：${err.message}`;
+    els.historyList.innerHTML = "";
+  }
+}
 
+function renderKnowledgeHistory(history, summary) {
+  const sourceCount = Number(summary.sources || history.length || 0);
+  const noteCount = Number(summary.notes || 0);
+  els.historySummary.innerHTML = [
+    `<span><strong>${sourceCount}</strong> 次来源记录</span>`,
+    `<span><strong>${noteCount}</strong> 条知识入库</span>`,
+  ].join("");
+
+  if (!history.length) {
+    els.historyList.innerHTML = `<li class="history-item">暂无入库历史。</li>`;
+    return;
+  }
+
+  els.historyList.innerHTML = history
+    .map((item) => {
+      const titles = (item.note_titles || []).slice(0, 4);
+      const titleText = titles.length ? titles.join("；") : "未生成知识条";
+      return `
+        <li class="history-item">
+          <strong>${escapeHtml(item.imported_at || item.created_at || "未知时间")}</strong>
+          <span>${escapeHtml(item.source_type || "unknown")} · 新知识 ${Number(item.note_count || 0)} 条 · ${escapeHtml(item.status || "")}</span>
+          <small>${escapeHtml(item.file_path || item.source_id || "")}</small>
+          <div>${escapeHtml(titleText)}</div>
+        </li>`;
+    })
+    .join("");
+}
+
+function renderKnowledgeNetwork(graph, run) {
+  const nodes = (graph.nodes || []).slice(0, 140);
+  const edges = (graph.edges || []).slice(0, 360);
+  const nodeMap = new Map(nodes.map((node) => [node.id, node]));
   const stats = run && run.stats ? run.stats : {};
+  const summary = graph.summary || {};
   els.networkSummary.innerHTML = [
-    `<strong>${nodes.length}</strong> 个节点`,
-    `<strong>${edges.length}</strong> 条关系`,
+    `<strong>${summary.unit_nodes || 0}</strong> 条知识`,
+    `<strong>${summary.concept_nodes || 0}</strong> 个概念`,
+    `<strong>${summary.structure_edges || 0}</strong> 条结构边`,
+    `<strong>${summary.semantic_edges || 0}</strong> 条语义边`,
     stats.duplicate_candidates !== undefined ? `<strong>${stats.duplicate_candidates}</strong> 个重复候选` : "",
     run ? `最近整理：${escapeHtml(run.status || "unknown")}` : "尚未整理",
   ]
@@ -279,8 +348,8 @@ function renderKnowledgeNetwork(notes, relations, run) {
     .map((item) => `<span>${item}</span>`)
     .join("");
 
-  renderGraph(nodes, edges, noteMap);
-  renderRelationList(edges, noteMap);
+  renderGraph(nodes, edges, nodeMap);
+  renderRelationList(edges, nodeMap);
 }
 
 function renderGraph(nodes, edges, noteMap) {
@@ -291,44 +360,56 @@ function renderGraph(nodes, edges, noteMap) {
 
   const width = 900;
   const height = 520;
-  const cx = width / 2;
-  const cy = height / 2;
-  const radius = Math.min(width, height) * 0.34;
   const positions = new Map();
+  const lanes = {
+    topic: { y: 70, nodes: [] },
+    concept: { y: 180, nodes: [] },
+    group: { y: 300, nodes: [] },
+    unit: { y: 430, nodes: [] },
+  };
 
-  nodes.forEach((node, index) => {
-    const angle = (Math.PI * 2 * index) / nodes.length - Math.PI / 2;
-    positions.set(node.note_id, {
-      x: cx + Math.cos(angle) * radius,
-      y: cy + Math.sin(angle) * radius,
+  nodes.forEach((node) => {
+    const lane = lanes[node.node_type] ? node.node_type : "unit";
+    lanes[lane].nodes.push(node);
+  });
+
+  Object.values(lanes).forEach((lane) => {
+    const count = Math.max(1, lane.nodes.length);
+    lane.nodes.forEach((node, index) => {
+      const margin = node.node_type === "unit" ? 48 : 70;
+      const x = margin + ((width - margin * 2) * (index + 0.5)) / count;
+      positions.set(node.id, { x, y: lane.y });
     });
   });
 
   const edgeHtml = edges
     .map((edge) => {
-      const a = positions.get(edge.from_note_id);
-      const b = positions.get(edge.to_note_id);
+      const a = positions.get(edge.from_id);
+      const b = positions.get(edge.to_id);
       if (!a || !b) return "";
-      return `<line class="edge edge-${escapeAttr(edge.relation_type || "related")}" x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}"><title>${escapeHtml(edge.relation_type || "")}</title></line>`;
+      const cls = `edge edge-${escapeAttr(edge.relation_layer || "semantic")} edge-${escapeAttr(edge.relation_strength || "medium")} edge-${escapeAttr(edge.relation_type || "related")}`;
+      return `<line class="${cls}" x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}"><title>${escapeHtml(edge.relation_type || "")}</title></line>`;
     })
     .join("");
 
   const nodeHtml = nodes
     .map((node) => {
-      const pos = positions.get(node.note_id);
-      const title = compactTitle(node.title || "未命名", 12);
+      const pos = positions.get(node.id);
+      if (!pos) return "";
+      const title = compactTitle(node.label || "未命名", node.node_type === "unit" ? 10 : 12);
+      const radius = node.node_type === "unit" ? 16 : node.node_type === "concept" ? 18 : 20;
       return `
-        <g class="graph-node">
-          <circle cx="${pos.x}" cy="${pos.y}" r="20"></circle>
+        <g class="graph-node graph-node-${escapeAttr(node.node_type || "unit")}">
+          <circle cx="${pos.x}" cy="${pos.y}" r="${radius}"></circle>
           <text x="${pos.x}" y="${pos.y + 36}" text-anchor="middle">${escapeHtml(title)}</text>
-          <title>${escapeHtml(node.title || "未命名")}</title>
+          <title>${escapeHtml(node.label || "未命名")}</title>
         </g>`;
     })
     .join("");
 
   const legend = `
     <g class="graph-legend">
-      <text x="24" y="32">same_group / sequence_next / shared_keyword / duplicate_of / related_to</text>
+      <text x="24" y="32">主题 -> 概念 -> 知识组 -> 知识条；强语义边用于检索扩展</text>
     </g>`;
 
   els.graph.innerHTML = `${legend}${edgeHtml}${nodeHtml}`;
@@ -342,13 +423,13 @@ function renderRelationList(relations, noteMap) {
   els.relationList.innerHTML = relations
     .slice(0, 80)
     .map((rel) => {
-      const from = noteMap.get(rel.from_note_id);
-      const to = noteMap.get(rel.to_note_id);
+      const from = noteMap.get(rel.from_id);
+      const to = noteMap.get(rel.to_id);
       return `
         <li class="relation-item">
           <strong>${escapeHtml(rel.relation_type || "related")}</strong>
-          <span>${escapeHtml((from && from.title) || rel.from_note_id)} → ${escapeHtml((to && to.title) || rel.to_note_id)}</span>
-          <small>score=${Number(rel.score || 0).toFixed(3)} ${escapeHtml(rel.reason || "")}</small>
+          <span>${escapeHtml((from && from.label) || rel.from_id)} → ${escapeHtml((to && to.label) || rel.to_id)}</span>
+          <small>${escapeHtml(rel.relation_layer || "")} · ${escapeHtml(rel.relation_strength || "")} · score=${Number(rel.score || 0).toFixed(3)} ${escapeHtml(rel.reason || "")}</small>
         </li>`;
     })
     .join("");
@@ -480,6 +561,17 @@ function appendImportLog(text) {
   const time = new Date().toLocaleTimeString();
   els.importLog.textContent += `[${time}] ${text}\n`;
   els.importLog.scrollTop = els.importLog.scrollHeight;
+}
+
+function setImportProgress(active, text, percent = 0) {
+  if (!els.importProgress || !els.importProgressText) return;
+  els.importProgress.classList.toggle("hidden", !active);
+  els.importProgress.classList.toggle("active", Boolean(active));
+  els.importProgressText.textContent = text || (active ? "正在处理..." : "等待开始");
+  const bar = els.importProgress.querySelector(".progress-bar");
+  if (bar) {
+    bar.style.setProperty("--progress-width", `${Math.max(0, Math.min(100, Number(percent || 0)))}%`);
+  }
 }
 
 async function apiGet(url) {

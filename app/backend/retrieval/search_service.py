@@ -171,7 +171,7 @@ class SearchService:
                 score += 0.05
             if term in haystacks["snippet"]:
                 score += 0.03
-        if item.snippet.startswith("same_group:"):
+        if item.snippet.startswith("near_group:"):
             score += 0.018
         if item.snippet.startswith("relation:"):
             score += 0.015
