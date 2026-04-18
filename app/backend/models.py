@@ -144,6 +144,12 @@ class SearchResult:
     imported_at: str | None
     score: float
     snippet: str
+    relevance_score: float = 0.0
+    relevance_level: str = ""
+    relevance_reason: str = ""
+    relation_type: str = ""
+    relation_strength: str = ""
+    match_source: str = ""
 
 
 def _string_list(value: Any) -> list[str]:

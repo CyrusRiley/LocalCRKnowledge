@@ -71,7 +71,15 @@ class QwenClient:
             prompts.answer_prompt(question, context_markdown),
             temperature=0.2,
             max_tokens=_env_int("QWEN_ANSWER_MAX_TOKENS", 1200),
-            timeout_seconds=_env_int("QWEN_ANSWER_TIMEOUT_SECONDS", min(self.timeout_seconds, 10)),
+            timeout_seconds=_env_int("QWEN_ANSWER_TIMEOUT_SECONDS", min(self.timeout_seconds, 75)),
+        )
+
+    def build_constrained_answer(self, question: str, evidence_markdown: str) -> str:
+        return self.chat(
+            prompts.constrained_answer_prompt(question, evidence_markdown),
+            temperature=0.15,
+            max_tokens=_env_int("QWEN_SYNTHESIS_MAX_TOKENS", 800),
+            timeout_seconds=_env_int("QWEN_SYNTHESIS_TIMEOUT_SECONDS", _env_int("QWEN_ANSWER_TIMEOUT_SECONDS", min(self.timeout_seconds, 75))),
         )
 
     def chat(

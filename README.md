@@ -7,7 +7,8 @@
 - 已实现：后端主链路、SQLite schema、FTS5 检索、增量目录扫描、Markdown 导出、基础测试、本地 Web 前端。
 - 已实现：长文本拆分为多条知识单元，保留同一 source 追溯关系，并生成 `knowledge_units`、`knowledge_groups`、关键词库和知识关系。
 - 已实现：知识库快速整理与全局整理，前端以知识网络展示主题、概念、知识组、知识条和强语义关系。
-- 已实现：检索问答默认使用摘录式回答，优先保证答案来自本地知识库内容。
+- 已实现：混合检索，组合 FTS、关键词库、知识关系网和向量语义检索；向量层默认使用本地 hash 兜底，并预留 `sentence-transformers` 多模型接入。
+- 已实现：检索问答可受约束调用本地模型生成综合回答；模型超时或输出异常时自动退回摘录式回答。
 - 已预留：PDF 文本提取模块，安装 `pypdf` 后可尝试解析简单文本型 PDF。
 - 暂未实现：Tauri 桌面壳。当前前端为本地 Web UI，优先验证业务流程与数据链路。
 
@@ -74,6 +75,54 @@ $env:LK_DISABLE_LLM="1"
 ```
 
 `LK_DISABLE_LLM=1` 用于本地验证主链路，会生成“待模型整理”的兜底条目，不代表真实整理效果。
+
+## 向量检索配置
+
+系统默认使用无需额外依赖的本地 hash 向量器作为兜底：
+
+```powershell
+$env:LK_EMBEDDING_ACTIVE="local"
+```
+
+已预置 `sentence-transformers` 多模型配置，目标模型为：
+
+- `bge-base-zh-v1.5`
+- `bge-m3`
+
+如果模型已下载到本地，可以这样启用：
+
+```powershell
+pip install sentence-transformers
+
+$env:LK_EMBEDDING_MODELS="zh=sentence_transformers,G:\LLM\embeddings\bge-base-zh-v1.5,0.55;multi=sentence_transformers,G:\LLM\embeddings\bge-m3,0.45;local=local,local-hash-ngram-384,0.25"
+$env:LK_EMBEDDING_ACTIVE="zh,multi,local"
+```
+
+也可以让程序按问题语言自动选择：
+
+```powershell
+$env:LK_EMBEDDING_ACTIVE="auto"
+```
+
+向量索引状态接口：
+
+```text
+GET http://127.0.0.1:8765/api/embeddings/status
+```
+
+重建当前 active 模型的向量索引：
+
+```text
+POST http://127.0.0.1:8765/api/embeddings/rebuild
+{"mode":"active","limit":10000}
+```
+
+重建所有已配置模型的向量索引：
+
+```text
+POST http://127.0.0.1:8765/api/embeddings/rebuild
+{"mode":"all","limit":10000}
+```
 
 ## 数据与隐私
 
@@ -163,6 +212,7 @@ app/backend/importer/        文本/PDF 导入与目录扫描
 app/backend/preprocess/      文本清洗、关键词预提取、基础分块
 app/backend/llm/             Qwen 调用、prompt、JSON 解析
 app/backend/formatter/       Markdown 模板生成
+app/backend/embeddings/      本地向量、sentence-transformers 接入与向量索引
 app/backend/indexing/        FTS 索引维护
 app/backend/keywords/        关键词归一、别名与关键词库
 app/backend/maintenance/     迁移与回填脚本

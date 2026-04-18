@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import sqlite3
 from collections.abc import Iterable
@@ -357,6 +358,43 @@ class KnowledgeRepository:
                 ),
             )
 
+    def upsert_unit_embedding(
+        self,
+        *,
+        unit_id: str,
+        note_id: str | None,
+        embedding_model: str,
+        text_hash: str,
+        vector: list[float],
+        now: str,
+    ) -> None:
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO unit_embeddings (
+                  embedding_id, unit_id, note_id, embedding_model, text_hash, vector_json,
+                  dimensions, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(unit_id, embedding_model) DO UPDATE SET
+                  note_id=excluded.note_id,
+                  text_hash=excluded.text_hash,
+                  vector_json=excluded.vector_json,
+                  dimensions=excluded.dimensions,
+                  updated_at=excluded.updated_at
+                """,
+                (
+                    _embedding_id(unit_id, embedding_model),
+                    unit_id,
+                    note_id,
+                    embedding_model,
+                    text_hash,
+                    _json(vector),
+                    len(vector),
+                    now,
+                    now,
+                ),
+            )
+
     def update_unit_for_note(
         self,
         *,
@@ -412,6 +450,85 @@ class KnowledgeRepository:
             item["keywords"] = _loads(item.pop("keywords_json", None))
             data.append(item)
         return data
+
+    def list_units_for_embedding(self, *, limit: int = 10000, model_name: str | None = None) -> list[dict[str, Any]]:
+        model_join = "AND e.embedding_model = ?" if model_name else ""
+        params: list[Any] = []
+        if model_name:
+            params.append(model_name)
+        params.append(limit)
+        rows = self.conn.execute(
+            f"""
+            SELECT
+              u.*, g.group_title, n.title AS note_title, n.summary AS note_summary,
+              n.faithful_content AS note_faithful_content, n.themes_json, n.keywords_json,
+              e.embedding_model, e.text_hash AS embedding_text_hash
+            FROM knowledge_units u
+            LEFT JOIN knowledge_groups g ON g.group_id = u.group_id
+            LEFT JOIN notes_structured n ON n.note_id = u.note_id
+            LEFT JOIN unit_embeddings e ON e.unit_id = u.unit_id {model_join}
+            WHERE u.note_id IS NOT NULL
+            ORDER BY u.updated_at DESC
+            LIMIT ?
+            """,
+            tuple(params),
+        ).fetchall()
+        data: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["attributes"] = _loads(item.pop("attributes_json", None))
+            item["themes"] = _loads(item.pop("themes_json", None))
+            item["keywords"] = _loads(item.pop("keywords_json", None))
+            data.append(item)
+        return data
+
+    def list_unit_embeddings(self, *, model_name: str | None = None, limit: int = 20000) -> list[dict[str, Any]]:
+        params: list[Any] = []
+        where = ""
+        if model_name:
+            where = "WHERE e.embedding_model = ?"
+            params.append(model_name)
+        params.append(limit)
+        rows = self.conn.execute(
+            f"""
+            SELECT
+              e.unit_id, e.note_id, e.embedding_model, e.text_hash, e.vector_json,
+              u.title AS unit_title, u.content AS unit_content, u.evidence AS unit_evidence,
+              n.*, s.file_path, s.imported_at
+            FROM unit_embeddings e
+            JOIN knowledge_units u ON u.unit_id = e.unit_id
+            JOIN notes_structured n ON n.note_id = e.note_id
+            LEFT JOIN sources s ON s.source_id = n.source_id
+            {where}
+            LIMIT ?
+            """,
+            tuple(params),
+        ).fetchall()
+        data: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["vector"] = _loads(item.pop("vector_json", None))
+            item["themes"] = _loads(item.pop("themes_json", None))
+            item["keywords"] = _loads(item.pop("keywords_json", None))
+            item["key_points"] = _loads(item.pop("key_points_json", None))
+            item["usage_scenarios"] = _loads(item.pop("usage_scenarios_json", None))
+            data.append(item)
+        return data
+
+    def embedding_counts_by_model(self) -> dict[str, int]:
+        rows = self.conn.execute(
+            """
+            SELECT embedding_model, COUNT(*) AS cnt
+            FROM unit_embeddings
+            GROUP BY embedding_model
+            ORDER BY embedding_model
+            """
+        ).fetchall()
+        return {str(row["embedding_model"]): int(row["cnt"]) for row in rows}
+
+    def count_knowledge_units(self) -> int:
+        row = self.conn.execute("SELECT COUNT(*) AS cnt FROM knowledge_units WHERE note_id IS NOT NULL").fetchone()
+        return int(row["cnt"] if row else 0)
 
     def list_units_for_graph(self, *, limit: int = 120) -> list[dict[str, Any]]:
         rows = self.conn.execute(
@@ -684,7 +801,7 @@ class KnowledgeRepository:
               LIMIT 1
             ),
             peers AS (
-              SELECT to_note_id AS note_id, relation_type, score AS rel_score
+              SELECT to_note_id AS note_id, relation_type, relation_strength, reason, score AS rel_score
               FROM knowledge_relations
               WHERE from_note_id IN ({placeholders})
                 AND run_id = (SELECT run_id FROM latest_run)
@@ -692,7 +809,7 @@ class KnowledgeRepository:
                 AND relation_layer IN ('semantic', 'structure')
                 AND relation_strength IN ('strong', 'medium')
               UNION ALL
-              SELECT from_note_id AS note_id, relation_type, score AS rel_score
+              SELECT from_note_id AS note_id, relation_type, relation_strength, reason, score AS rel_score
               FROM knowledge_relations
               WHERE to_note_id IN ({placeholders})
                 AND run_id = (SELECT run_id FROM latest_run)
@@ -703,7 +820,7 @@ class KnowledgeRepository:
             SELECT DISTINCT
               n.*, s.file_path, s.imported_at,
               55.0 AS score,
-              'relation:' || peers.relation_type AS snippet
+              'relation:' || peers.relation_type || ':' || peers.relation_strength || ':' || COALESCE(peers.reason, '') AS snippet
             FROM peers
             JOIN notes_structured n ON n.note_id = peers.note_id
             LEFT JOIN sources s ON s.source_id = n.source_id
@@ -761,6 +878,37 @@ class KnowledgeRepository:
             pass
 
         return self._like_search(query, limit=limit, theme=theme, note_type=note_type)
+
+    def search_notes_by_vector(self, query_vector: list[float], *, model_name: str, limit: int = 10) -> list[SearchResult]:
+        from app.backend.embeddings.local_embedder import cosine_similarity
+
+        rows = self.list_unit_embeddings(model_name=model_name, limit=20000)
+        scored: list[tuple[dict[str, Any], float]] = []
+        for row in rows:
+            score = cosine_similarity(query_vector, row.get("vector") or [])
+            if score > 0:
+                scored.append((row, score))
+        scored.sort(key=lambda item: item[1], reverse=True)
+        results: list[SearchResult] = []
+        for row, score in scored[:limit]:
+            results.append(
+                SearchResult(
+                    note_id=row["note_id"],
+                    source_id=row["source_id"],
+                    title=row["title"],
+                    note_type=row.get("note_type") or "",
+                    summary=row.get("summary") or "",
+                    markdown_content=row.get("markdown_content") or "",
+                    source_excerpt=row.get("source_excerpt") or "",
+                    themes=row.get("themes") or [],
+                    keywords=row.get("keywords") or [],
+                    file_path=row.get("file_path"),
+                    imported_at=row.get("imported_at"),
+                    score=float(score),
+                    snippet=f"vector:{row.get('unit_title') or row.get('title') or ''}",
+                )
+            )
+        return results
 
     def get_adjacent_chunk_notes(
         self,
@@ -1052,6 +1200,11 @@ class KnowledgeRepository:
 
 def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False)
+
+
+def _embedding_id(unit_id: str, embedding_model: str) -> str:
+    digest = hashlib.sha1(f"{unit_id}:{embedding_model}".encode("utf-8")).hexdigest()
+    return f"emb-{digest}"
 
 
 def _join_text(*values: Any) -> str:

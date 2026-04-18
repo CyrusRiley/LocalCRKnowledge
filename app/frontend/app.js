@@ -2,6 +2,8 @@ const state = {
   currentRawText: "",
   currentMarkdown: "",
   latestAnswer: "",
+  importJobId: "",
+  importPollTimer: null,
   organizeRunId: "",
   organizePollTimer: null,
   notes: [],
@@ -116,14 +118,16 @@ async function importText() {
     return;
   }
   appendImportLog("正在调用后端整理文本...");
-  setImportProgress(true, "正在整理并写入知识库...", 20);
+  setImportProgress(true, "正在启动导入任务...", 2);
+  let completed = false;
   try {
-    const data = await apiPost("/api/import/text", {
+    const data = await runImportJob({
+      kind: "text",
       text,
       direction: els.direction.value,
       export: false,
     });
-    setImportProgress(true, "整理完成，正在刷新知识网络...", 88);
+    setImportProgress(true, "整理完成，正在刷新知识网络...", 96);
     appendImportLog(JSON.stringify(data, null, 2));
     if (data.markdown) {
       updateResultView(text, data.markdown);
@@ -131,10 +135,11 @@ async function importText() {
     }
     refreshNetwork();
     refreshKnowledgeHistory();
+    completed = true;
   } catch (err) {
     appendImportLog(`整理失败：${err.message}`);
   } finally {
-    setImportProgress(false, "整理完成", 100);
+    setImportProgress(false, completed ? "整理完成" : "整理失败", completed ? 100 : 0);
   }
 }
 
@@ -146,6 +151,7 @@ async function importFiles() {
   }
   appendImportLog(`正在处理 ${files.length} 个上传文件...`);
   setImportProgress(true, `正在读取 ${files.length} 个文件...`, 8);
+  let completed = false;
   try {
     const payloadFiles = [];
     for (const file of files) {
@@ -153,14 +159,15 @@ async function importFiles() {
       payloadFiles.push({ name: file.name, content });
       setImportProgress(true, `已读取 ${payloadFiles.length}/${files.length} 个文件...`, Math.round((payloadFiles.length / files.length) * 35));
     }
-    setImportProgress(true, `正在整理并写入 ${files.length} 个文件...`, 45);
-    const data = await apiPost("/api/import/files", {
+    setImportProgress(true, `正在启动 ${files.length} 个文件的导入任务...`, 40);
+    const data = await runImportJob({
+      kind: "files",
       files: payloadFiles,
       direction: els.direction.value,
       export: false,
     });
     appendImportLog(JSON.stringify(data, null, 2));
-    setImportProgress(true, "导入完成，正在刷新知识网络...", 88);
+    setImportProgress(true, "导入完成，正在刷新知识网络...", 96);
     const lastSuccess = (data.results || []).find((item) => item.markdown);
     if (lastSuccess && lastSuccess.markdown) {
       updateResultView("", lastSuccess.markdown);
@@ -168,10 +175,11 @@ async function importFiles() {
     }
     refreshNetwork();
     refreshKnowledgeHistory();
+    completed = true;
   } catch (err) {
     appendImportLog(`文件导入失败：${err.message}`);
   } finally {
-    setImportProgress(false, "导入完成", 100);
+    setImportProgress(false, completed ? "导入完成" : "导入失败", completed ? 100 : 0);
   }
 }
 
@@ -182,14 +190,16 @@ async function importFileByPath() {
     return;
   }
   appendImportLog(`正在导入文件：${path}`);
-  setImportProgress(true, "正在导入本地文件...", 25);
+  setImportProgress(true, "正在启动本地文件导入任务...", 2);
+  let completed = false;
   try {
-    const data = await apiPost("/api/import/file-path", {
+    const data = await runImportJob({
+      kind: "file_path",
       path,
       direction: els.direction.value,
       export: false,
     });
-    setImportProgress(true, "导入完成，正在刷新知识网络...", 88);
+    setImportProgress(true, "导入完成，正在刷新知识网络...", 96);
     appendImportLog(JSON.stringify(data, null, 2));
     if (data.markdown) {
       updateResultView("", data.markdown);
@@ -197,10 +207,11 @@ async function importFileByPath() {
     }
     refreshNetwork();
     refreshKnowledgeHistory();
+    completed = true;
   } catch (err) {
     appendImportLog(`路径导入失败：${err.message}`);
   } finally {
-    setImportProgress(false, "导入完成", 100);
+    setImportProgress(false, completed ? "导入完成" : "导入失败", completed ? 100 : 0);
   }
 }
 
@@ -211,22 +222,84 @@ async function importDirectory() {
     return;
   }
   appendImportLog(`正在增量扫描目录：${path}`);
-  setImportProgress(true, "正在扫描目录并增量入库...", 25);
+  setImportProgress(true, "正在启动目录增量任务...", 2);
+  let completed = false;
   try {
-    const data = await apiPost("/api/import/dir", {
+    const data = await runImportJob({
+      kind: "dir",
       path,
       direction: els.direction.value,
       recursive: true,
     });
-    setImportProgress(true, "增量更新完成，正在刷新知识网络...", 88);
+    setImportProgress(true, "增量更新完成，正在刷新知识网络...", 96);
     appendImportLog(JSON.stringify(data, null, 2));
     refreshNetwork();
     refreshKnowledgeHistory();
+    completed = true;
   } catch (err) {
     appendImportLog(`目录增量失败：${err.message}`);
   } finally {
-    setImportProgress(false, "增量更新完成", 100);
+    setImportProgress(false, completed ? "增量更新完成" : "增量更新失败", completed ? 100 : 0);
   }
+}
+
+async function runImportJob(payload) {
+  const started = await apiPost("/api/import/start", payload);
+  state.importJobId = started.job_id || "";
+  if (!state.importJobId) {
+    throw new Error("后端没有返回导入任务 ID");
+  }
+  appendImportLog(`导入任务已启动：${state.importJobId}`);
+  return waitForImportJob(state.importJobId);
+}
+
+function waitForImportJob(jobId) {
+  if (state.importPollTimer) {
+    clearInterval(state.importPollTimer);
+    state.importPollTimer = null;
+  }
+
+  return new Promise((resolve, reject) => {
+    state.importPollTimer = setInterval(async () => {
+      try {
+        const data = await apiGet(`/api/import/status?job_id=${encodeURIComponent(jobId)}`);
+        const job = data.job || {};
+        const status = job.status || "running";
+        const percent = Number(job.percent || 0);
+        setImportProgress(true, formatImportProgressMessage(job), percent);
+
+        if (status === "completed") {
+          clearInterval(state.importPollTimer);
+          state.importPollTimer = null;
+          state.importJobId = "";
+          resolve(job.result || {});
+        } else if (status === "failed") {
+          clearInterval(state.importPollTimer);
+          state.importPollTimer = null;
+          state.importJobId = "";
+          reject(new Error(job.error || job.message || "导入任务失败"));
+        }
+      } catch (err) {
+        clearInterval(state.importPollTimer);
+        state.importPollTimer = null;
+        state.importJobId = "";
+        reject(err);
+      }
+    }, 1000);
+  });
+}
+
+function formatImportProgressMessage(job) {
+  const pieces = [];
+  const message = job.message || "正在处理...";
+  pieces.push(message);
+  if (job.current_file && job.total_files) {
+    pieces.push(`文件 ${job.current_file}/${job.total_files}`);
+  }
+  if (job.current_chunk && job.total_chunks) {
+    pieces.push(`知识单元 ${job.current_chunk}/${job.total_chunks}`);
+  }
+  return pieces.join(" · ");
 }
 
 async function startOrganizeLibrary(mode = "quick") {
@@ -522,7 +595,14 @@ function renderSearchResults(results) {
       (item) => `
       <li class="note-item">
         <strong>${escapeHtml(item.title || "未命名")}</strong>
-        <small>${escapeHtml(item.note_type || "未分类")} · score=${Number(item.score || 0).toFixed(4)}</small>
+        <small>
+          ${escapeHtml(item.note_type || "未分类")}
+          · ${escapeHtml(item.relevance_level || "相关")}
+          · 相关度=${Number(item.relevance_score || 0).toFixed(3)}
+          ${item.relation_type ? ` · 关系=${escapeHtml(item.relation_type)}` : ""}
+          ${item.match_source === "vector" ? " · 向量语义" : ""}
+        </small>
+        <small>${escapeHtml(item.relevance_reason || "")}</small>
         <div>${escapeHtml(item.snippet || "")}</div>
       </li>
     `,

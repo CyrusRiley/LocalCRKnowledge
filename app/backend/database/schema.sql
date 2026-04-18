@@ -164,3 +164,21 @@ CREATE TABLE IF NOT EXISTS unit_keywords (
 );
 
 CREATE INDEX IF NOT EXISTS idx_unit_keywords_term ON unit_keywords(term_id);
+
+CREATE TABLE IF NOT EXISTS unit_embeddings (
+  embedding_id TEXT PRIMARY KEY,
+  unit_id TEXT NOT NULL,
+  note_id TEXT,
+  embedding_model TEXT NOT NULL,
+  text_hash TEXT NOT NULL,
+  vector_json TEXT NOT NULL,
+  dimensions INTEGER NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY(unit_id) REFERENCES knowledge_units(unit_id) ON DELETE CASCADE,
+  FOREIGN KEY(note_id) REFERENCES notes_structured(note_id) ON DELETE CASCADE
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_unit_embeddings_unit_model ON unit_embeddings(unit_id, embedding_model);
+CREATE INDEX IF NOT EXISTS idx_unit_embeddings_note ON unit_embeddings(note_id);
+CREATE INDEX IF NOT EXISTS idx_unit_embeddings_model ON unit_embeddings(embedding_model);

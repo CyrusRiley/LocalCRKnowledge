@@ -4,6 +4,7 @@ from logging import Logger
 from uuid import uuid4
 
 from app.backend.database.repository import KnowledgeRepository
+from app.backend.embeddings.indexer import index_unit_embeddings
 from app.backend.keywords.normalizer import canonicalize_keywords
 from app.backend.models import KnowledgeGroup, KnowledgeUnit
 from app.backend.utils.time_utils import utc_now_iso
@@ -51,28 +52,41 @@ def backfill_v2_structures(repo: KnowledgeRepository, logger: Logger | None = No
             [*(note.get("keywords") or []), *(note.get("themes") or [])],
             source="backfill",
         )
-        repo.insert_knowledge_unit(
-            KnowledgeUnit(
-                unit_id=unit_id,
-                group_id=group_id,
-                source_id=source_id,
-                note_id=str(note.get("note_id") or ""),
-                title=str(note.get("title") or "未命名条目"),
-                content=_unit_content(note),
-                evidence=str(note.get("source_excerpt") or ""),
-                note_type=str(note.get("note_type") or ""),
-                order_index=0,
-                confidence=0.6,
-                attributes={
-                    "themes": note.get("themes") or [],
-                    "faithful_content": str(note.get("faithful_content") or "")[:1200],
-                    "key_points": note.get("key_points") or [],
-                    "usage_scenarios": note.get("usage_scenarios") or [],
-                    "backfilled_keywords": keywords,
-                },
-                created_at=now,
-                updated_at=now,
-            )
+        unit = KnowledgeUnit(
+            unit_id=unit_id,
+            group_id=group_id,
+            source_id=source_id,
+            note_id=str(note.get("note_id") or ""),
+            title=str(note.get("title") or "未命名条目"),
+            content=_unit_content(note),
+            evidence=str(note.get("source_excerpt") or ""),
+            note_type=str(note.get("note_type") or ""),
+            order_index=0,
+            confidence=0.6,
+            attributes={
+                "themes": note.get("themes") or [],
+                "faithful_content": str(note.get("faithful_content") or "")[:1200],
+                "key_points": note.get("key_points") or [],
+                "usage_scenarios": note.get("usage_scenarios") or [],
+                "backfilled_keywords": keywords,
+            },
+            created_at=now,
+            updated_at=now,
+        )
+        repo.insert_knowledge_unit(unit)
+        index_unit_embeddings(
+            repo,
+            {
+                "unit_id": unit.unit_id,
+                "note_id": unit.note_id,
+                "title": unit.title,
+                "content": unit.content,
+                "evidence": unit.evidence,
+                "note_summary": note.get("summary") or "",
+                "note_faithful_content": note.get("faithful_content") or "",
+                "themes": note.get("themes") or [],
+                "keywords": note.get("keywords") or [],
+            },
         )
         repo.replace_unit_keywords(unit_id, links)
         units += 1

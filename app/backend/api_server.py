@@ -17,6 +17,8 @@ from app.backend.database.db import connect, init_db
 from app.backend.database.repository import KnowledgeRepository
 from app.backend.export.markdown_exporter import export_markdown, safe_filename
 from app.backend.formatter.markdown_builder import build_note_markdown
+from app.backend.embeddings.indexer import index_unit_embeddings, rebuild_unit_embeddings
+from app.backend.embeddings.providers import active_embedding_models, configured_embedding_models
 from app.backend.importer.text_importer import build_file_source, build_manual_source
 from app.backend.keywords.normalizer import canonicalize_keywords
 from app.backend.llm.client import QwenClient
@@ -42,6 +44,8 @@ class Runtime:
     logger: object | None = None
     organize_jobs: dict[str, dict] = field(default_factory=dict)
     organize_lock: threading.Lock = field(default_factory=threading.Lock)
+    import_jobs: dict[str, dict] = field(default_factory=dict)
+    import_lock: threading.Lock = field(default_factory=threading.Lock)
 
 
 @dataclass
@@ -167,6 +171,39 @@ class RequestHandler(BaseHTTPRequestHandler):
                     ctx.close()
                 return
 
+            if parsed.path == "/api/import/status":
+                params = parse_qs(parsed.query)
+                job_id = (params.get("job_id", [""])[0] or "").strip()
+                if not job_id:
+                    self._json_response(HTTPStatus.BAD_REQUEST, {"error": "job_id is required"})
+                    return
+                with self.runtime.import_lock:
+                    job = dict(self.runtime.import_jobs.get(job_id, {}))
+                if not job:
+                    self._json_response(HTTPStatus.NOT_FOUND, {"error": "import job not found"})
+                    return
+                self._json_response(HTTPStatus.OK, {"job": job})
+                return
+
+            if parsed.path == "/api/embeddings/status":
+                ctx = ServiceContext.from_runtime(self.runtime)
+                try:
+                    configured = configured_embedding_models()
+                    active = active_embedding_models()
+                    counts = ctx.repo.embedding_counts_by_model()
+                    total_units = ctx.repo.count_knowledge_units()
+                    self._json_response(
+                        HTTPStatus.OK,
+                        {
+                            "total_units": total_units,
+                            "configured_models": [_embedding_config_dict(item, counts) for item in configured],
+                            "active_models": [item.model_name for item in active],
+                        },
+                    )
+                finally:
+                    ctx.close()
+                return
+
             if parsed.path == "/api/library/organize/status":
                 params = parse_qs(parsed.query)
                 run_id = (params.get("run_id", [""])[0] or "").strip()
@@ -241,6 +278,60 @@ class RequestHandler(BaseHTTPRequestHandler):
     def _handle_api_post(self, parsed) -> None:
         try:
             payload = self._read_json()
+
+            if parsed.path == "/api/import/start":
+                kind = str(payload.get("kind") or "").strip()
+                if kind not in {"text", "files", "file_path", "dir"}:
+                    self._json_response(HTTPStatus.BAD_REQUEST, {"error": "kind must be text, files, file_path, or dir"})
+                    return
+                if kind == "text" and not str(payload.get("text") or "").strip():
+                    self._json_response(HTTPStatus.BAD_REQUEST, {"error": "text is required"})
+                    return
+                if kind == "files":
+                    files = payload.get("files") or []
+                    if not isinstance(files, list) or not files:
+                        self._json_response(HTTPStatus.BAD_REQUEST, {"error": "files is required"})
+                        return
+                if kind == "file_path" and not str(payload.get("path") or "").strip():
+                    self._json_response(HTTPStatus.BAD_REQUEST, {"error": "path is required"})
+                    return
+                if kind == "dir" and not str(payload.get("path") or "").strip():
+                    self._json_response(HTTPStatus.BAD_REQUEST, {"error": "path is required"})
+                    return
+
+                with self.runtime.import_lock:
+                    running = [
+                        job_id
+                        for job_id, item in self.runtime.import_jobs.items()
+                        if item.get("status") == "running"
+                    ]
+                    if running:
+                        self._json_response(
+                            HTTPStatus.OK,
+                            {"status": "running", "job_id": running[0], "message": "already running"},
+                        )
+                        return
+
+                job_id = str(uuid4())
+                started_at = utc_now_iso()
+                with self.runtime.import_lock:
+                    self.runtime.import_jobs[job_id] = {
+                        "job_id": job_id,
+                        "kind": kind,
+                        "status": "running",
+                        "message": "导入任务已启动",
+                        "percent": 1,
+                        "started_at": started_at,
+                        "updated_at": started_at,
+                    }
+                worker = threading.Thread(
+                    target=_run_import_job,
+                    args=(self.runtime, job_id, payload),
+                    daemon=True,
+                )
+                worker.start()
+                self._json_response(HTTPStatus.OK, {"status": "running", "job_id": job_id})
+                return
 
             if parsed.path == "/api/import/text":
                 text = str(payload.get("text") or "").strip()
@@ -459,6 +550,18 @@ class RequestHandler(BaseHTTPRequestHandler):
                     ctx.close()
                 return
 
+            if parsed.path == "/api/embeddings/rebuild":
+                mode = str(payload.get("mode") or "active").strip().lower()
+                configs = configured_embedding_models() if mode == "all" else active_embedding_models()
+                limit = _to_int(payload.get("limit"), default=10000, min_value=1, max_value=100000)
+                ctx = ServiceContext.from_runtime(self.runtime)
+                try:
+                    stats = rebuild_unit_embeddings(ctx.repo, limit=limit, configs=configs)
+                    self._json_response(HTTPStatus.OK, {"status": "ok", "stats": stats})
+                finally:
+                    ctx.close()
+                return
+
             if parsed.path == "/api/notes/update":
                 note_id = str(payload.get("note_id") or "").strip()
                 if not note_id:
@@ -519,6 +622,19 @@ class RequestHandler(BaseHTTPRequestHandler):
                     unit = ctx.repo.get_unit_by_note_id(note_id)
                     if unit:
                         ctx.repo.replace_unit_keywords(unit["unit_id"], keyword_links)
+                        index_unit_embeddings(
+                            ctx.repo,
+                            {
+                                **unit,
+                                "title": normalized["title"],
+                                "content": _unit_content_from_payload(normalized),
+                                "evidence": normalized["source_excerpt"],
+                                "note_summary": normalized["summary"],
+                                "note_faithful_content": normalized["faithful_content"],
+                                "themes": normalized["themes"],
+                                "keywords": normalized["keywords"],
+                            },
+                        )
                     self._json_response(HTTPStatus.OK, {"status": "ok", "note": ctx.repo.get_note(note_id)})
                 finally:
                     ctx.close()
@@ -640,6 +756,23 @@ def _result_dict(item) -> dict:
         "imported_at": item.imported_at,
         "score": item.score,
         "snippet": item.snippet,
+        "relevance_score": item.relevance_score,
+        "relevance_level": item.relevance_level,
+        "relevance_reason": item.relevance_reason,
+        "relation_type": item.relation_type,
+        "relation_strength": item.relation_strength,
+        "match_source": item.match_source,
+    }
+
+
+def _embedding_config_dict(config, counts: dict[str, int]) -> dict:
+    return {
+        "key": config.key,
+        "provider": config.provider,
+        "model_path": config.model_path,
+        "model_name": config.model_name,
+        "weight": config.weight,
+        "indexed_units": counts.get(config.model_name, 0),
     }
 
 
@@ -693,6 +826,196 @@ def _unit_content_from_payload(payload: dict) -> str:
     if payload.get("user_insights"):
         parts.append(str(payload["user_insights"]))
     return "\n".join(parts).strip() or str(payload.get("source_excerpt") or "")
+
+
+def _run_import_job(runtime: Runtime, job_id: str, payload: dict) -> None:
+    kind = str(payload.get("kind") or "").strip()
+    direction = str(payload.get("direction") or "提炼为可用于写作的知识摘要")
+    should_export = bool(payload.get("export"))
+
+    def set_live(status: str, message: str, percent: int, **extra) -> None:
+        with runtime.import_lock:
+            current = dict(runtime.import_jobs.get(job_id, {}))
+            current.update(
+                {
+                    "job_id": job_id,
+                    "kind": kind,
+                    "status": status,
+                    "message": message,
+                    "percent": max(0, min(100, int(percent))),
+                    "updated_at": utc_now_iso(),
+                    **extra,
+                }
+            )
+            runtime.import_jobs[job_id] = current
+
+    def map_source_progress(item: dict, *, start: int = 5, end: int = 92, **extra) -> None:
+        source_percent = int(item.get("percent") or 0)
+        overall = start + int((source_percent / 100) * max(1, end - start))
+        set_live(
+            "running",
+            str(item.get("message") or "正在处理来源"),
+            min(end, overall),
+            stage=item.get("stage"),
+            current_chunk=item.get("current_chunk"),
+            total_chunks=item.get("total_chunks"),
+            **extra,
+        )
+
+    conn = connect(runtime.settings.db_path)
+    init_db(conn)
+    repo = KnowledgeRepository(conn)
+    llm_client = QwenClient(
+        base_url=runtime.settings.llm_base_url,
+        model=runtime.settings.llm_model,
+        timeout_seconds=runtime.settings.llm_timeout_seconds,
+    )
+    logger = setup_logger(runtime.settings.log_dir, f"{runtime.logger_name}_import")
+    try:
+        set_live("running", "正在准备导入任务", 2)
+        if kind == "text":
+            result = process_source(
+                build_manual_source(str(payload.get("text") or "")),
+                direction=direction,
+                repo=repo,
+                llm_client=llm_client,
+                settings=runtime.settings,
+                logger=logger,
+                progress_cb=lambda item: map_source_progress(item),
+            )
+            if should_export and result.get("markdown"):
+                set_live("running", "正在导出 Markdown", 94)
+                result["exported_path"] = str(
+                    export_markdown(
+                        result["markdown"],
+                        runtime.settings.export_dir,
+                        result.get("note_id") or result.get("source_id") or "note",
+                    )
+                )
+            set_live("completed", "导入完成", 100, result=result)
+            return
+
+        if kind == "file_path":
+            file_path = str(payload.get("path") or "").strip()
+            path_obj = Path(file_path)
+            if not path_obj.exists() or not path_obj.is_file():
+                raise ValueError(f"file not found: {file_path}")
+            if path_obj.suffix.lower() not in {".txt", ".md"}:
+                raise ValueError("only .txt/.md are supported in this quick UI")
+            result = process_source(
+                build_file_source(path_obj),
+                direction=direction,
+                repo=repo,
+                llm_client=llm_client,
+                settings=runtime.settings,
+                logger=logger,
+                progress_cb=lambda item: map_source_progress(item, file_path=str(path_obj)),
+            )
+            if should_export and result.get("markdown"):
+                set_live("running", "正在导出 Markdown", 94)
+                result["exported_path"] = str(
+                    export_markdown(
+                        result["markdown"],
+                        runtime.settings.export_dir,
+                        result.get("note_id") or result.get("source_id") or "note",
+                    )
+                )
+            set_live("completed", "导入完成", 100, result=result)
+            return
+
+        if kind == "files":
+            files = payload.get("files") or []
+            if not isinstance(files, list) or not files:
+                raise ValueError("files is required")
+            upload_dir = runtime.settings.import_dir / "uploaded"
+            upload_dir.mkdir(parents=True, exist_ok=True)
+            results: list[dict] = []
+            total_files = len(files)
+            for index, item in enumerate(files):
+                name = safe_filename(str(item.get("name") or "uploaded.txt"))
+                file_start = 5 + int((index / total_files) * 87)
+                file_end = 5 + int(((index + 1) / total_files) * 87)
+                set_live(
+                    "running",
+                    f"正在准备第 {index + 1}/{total_files} 个文件：{name}",
+                    file_start,
+                    current_file=index + 1,
+                    total_files=total_files,
+                )
+                if not name.lower().endswith((".txt", ".md")):
+                    results.append({"status": "failed", "file_name": name, "reason": "unsupported_extension"})
+                    continue
+                content = str(item.get("content") or "")
+                target = upload_dir / name
+                target.write_text(content, encoding="utf-8")
+                try:
+                    result = process_source(
+                        build_file_source(target),
+                        direction=direction,
+                        repo=repo,
+                        llm_client=llm_client,
+                        settings=runtime.settings,
+                        logger=logger,
+                        progress_cb=lambda event, start=file_start, end=file_end, idx=index, fname=name: map_source_progress(
+                            event,
+                            start=start,
+                            end=end,
+                            current_file=idx + 1,
+                            total_files=total_files,
+                            file_name=fname,
+                        ),
+                    )
+                    if should_export and result.get("markdown"):
+                        result["exported_path"] = str(
+                            export_markdown(
+                                result["markdown"],
+                                runtime.settings.export_dir,
+                                result.get("note_id") or result.get("source_id") or "note",
+                            )
+                        )
+                    results.append(result)
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("Failed to import uploaded file %s: %s", name, exc)
+                    results.append({"status": "failed", "file_name": name, "reason": str(exc)})
+            set_live("completed", "批量导入完成", 100, result={"results": results})
+            return
+
+        if kind == "dir":
+            dir_path = str(payload.get("path") or "").strip()
+            path_obj = Path(dir_path)
+            if not path_obj.exists() or not path_obj.is_dir():
+                raise ValueError(f"directory not found: {dir_path}")
+            updater = IncrementalUpdater(
+                repo=repo,
+                llm_client=llm_client,
+                settings=runtime.settings,
+                logger=logger,
+            )
+            results = updater.update_directory(
+                path_obj,
+                direction=direction,
+                recursive=bool(payload.get("recursive", True)),
+                progress_cb=lambda item: set_live(
+                    "failed" if str(item.get("status") or "") == "failed" else "running",
+                    str(item.get("message") or ""),
+                    min(99, int(item.get("percent") or 0)),
+                    stage=item.get("stage"),
+                    current_file=item.get("current_file"),
+                    total_files=item.get("total_files"),
+                    file_path=item.get("file_path"),
+                    current_chunk=item.get("current_chunk"),
+                    total_chunks=item.get("total_chunks"),
+                ),
+            )
+            set_live("completed", "目录增量导入完成", 100, result={"status": "ok", "results": results})
+            return
+
+        raise ValueError(f"Unsupported import kind: {kind}")
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Import job failed: %s", exc)
+        set_live("failed", str(exc), 100, error=str(exc))
+    finally:
+        conn.close()
 
 
 def _run_organize_job(runtime: Runtime, run_id: str, mode: str = "quick") -> None:

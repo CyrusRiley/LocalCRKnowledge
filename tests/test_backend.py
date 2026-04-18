@@ -203,6 +203,37 @@ class BackendTests(unittest.TestCase):
         )
         self.assertEqual(result.mode, "extract")
         self.assertIn("ABM can explain route preference.", result.content)
+        self.assertIn("主要相关材料", result.content)
+        self.assertIn("可直接用于写作的段落", result.content)
+
+    def test_answer_builder_uses_constrained_model_when_available(self) -> None:
+        item = SearchResult(
+            note_id="note-answer-model",
+            source_id="source-answer-model",
+            title="慢跑路径偏好",
+            note_type="summary",
+            summary="慢跑路径选择受到遮荫、连续性和安全性的共同影响。",
+            markdown_content="# 慢跑路径偏好\n\n## 保真整理\n慢跑路径选择受到遮荫、连续性和安全性的共同影响，适合用于解释公共空间中的路径偏好。",
+            source_excerpt="慢跑路径选择受到遮荫、连续性和安全性的共同影响。",
+            themes=["路径偏好"],
+            keywords=["慢跑", "路径偏好"],
+            file_path=None,
+            imported_at=None,
+            score=1.0,
+            snippet="慢跑路径偏好",
+            relevance_score=2.0,
+            relevance_level="高相关",
+            relevance_reason="标题命中“路径偏好”",
+        )
+        result = build_answer_result(
+            "慢跑路径偏好是什么？",
+            [item],
+            llm_client=FakeAnswerClient(),
+            logger=setup_logger(Path("data/logs"), name="answer_model_mode_test"),
+        )
+        self.assertEqual(result.mode, "model")
+        self.assertIn("综合回答", result.content)
+        self.assertIn("慢跑路径偏好可以理解为", result.content)
 
     def test_repository_update_note_refreshes_fts(self) -> None:
         conn = memory_conn()
@@ -460,7 +491,73 @@ class BackendTests(unittest.TestCase):
         results = service.keyword_search("ABM", limit=5)
         self.assertIn("note-method", {item.note_id for item in results})
         self.assertIn("note-evidence", {item.note_id for item in results})
+        evidence = next(item for item in results if item.note_id == "note-evidence")
+        self.assertEqual(evidence.relation_type, "supports")
+        self.assertIn("知识关系网扩展", evidence.relevance_reason)
         os.environ.pop("LK_DISABLE_LLM", None)
+
+    def test_vector_search_adds_semantic_candidate(self) -> None:
+        os.environ["LK_DISABLE_LLM"] = "1"
+        conn = memory_conn()
+        repo = KnowledgeRepository(conn)
+        source = _source("vector source")
+        source.clean_text = source.raw_text
+        repo.upsert_source(source)
+        now = utc_now_iso()
+        group_id = "group-vector"
+        repo.upsert_knowledge_group(
+            KnowledgeGroup(
+                group_id=group_id,
+                source_id=source.source_id,
+                group_title="Vector group",
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        note = _note("note-vector-route", source.source_id, "跑步路线选择", "跑步者会根据遮荫和连续性选择路线。", ["路线选择"])
+        repo.insert_note(note, [])
+        repo.insert_knowledge_unit(
+            KnowledgeUnit("unit-vector-route", group_id, source.source_id, note.note_id, note.title, note.summary, evidence=note.source_excerpt, order_index=0, created_at=now, updated_at=now)
+        )
+        service = SearchService(repo, QwenClient("http://127.0.0.1:8080/v1", "qwen2.5", timeout_seconds=1), setup_logger(Path("data/logs"), name="search_vector_test"))
+        results = service.keyword_search("慢跑路径偏好", limit=5)
+        self.assertIn("note-vector-route", {item.note_id for item in results})
+        item = next(item for item in results if item.note_id == "note-vector-route")
+        self.assertTrue(item.relevance_score > 0)
+        self.assertIn("向量", item.relevance_reason)
+        os.environ.pop("LK_DISABLE_LLM", None)
+
+    def test_repository_stores_multiple_embedding_models_per_unit(self) -> None:
+        conn = memory_conn()
+        repo = KnowledgeRepository(conn)
+        source = _source("multi embedding")
+        source.clean_text = source.raw_text
+        repo.upsert_source(source)
+        now = utc_now_iso()
+        note = _note("note-multi-emb", source.source_id, "Multi embedding", "same unit, multiple vectors", ["embedding"])
+        repo.insert_note(note, [])
+        repo.insert_knowledge_unit(
+            KnowledgeUnit("unit-multi-emb", None, source.source_id, note.note_id, note.title, note.summary, created_at=now, updated_at=now)
+        )
+        repo.upsert_unit_embedding(
+            unit_id="unit-multi-emb",
+            note_id=note.note_id,
+            embedding_model="model-a",
+            text_hash="hash-a",
+            vector=[1.0, 0.0],
+            now=now,
+        )
+        repo.upsert_unit_embedding(
+            unit_id="unit-multi-emb",
+            note_id=note.note_id,
+            embedding_model="model-b",
+            text_hash="hash-b",
+            vector=[0.0, 1.0],
+            now=now,
+        )
+        counts = repo.embedding_counts_by_model()
+        self.assertEqual(counts["model-a"], 1)
+        self.assertEqual(counts["model-b"], 1)
 
     def test_relation_builder_creates_layered_sequence_without_group_mesh(self) -> None:
         conn = memory_conn()
@@ -799,6 +896,16 @@ def _note(note_id: str, source_id: str, title: str, summary: str, keywords: list
         created_at=now,
         updated_at=now,
     )
+
+
+class FakeAnswerClient:
+    def build_constrained_answer(self, question: str, evidence_markdown: str) -> str:
+        return (
+            "慢跑路径偏好可以理解为个体在公共空间中选择慢跑路线时形成的综合判断，它并不只取决于距离，"
+            "还受到遮荫、连续性和安全性的共同影响。已有材料表明，这类偏好适合被放入公共空间行为机制的讨论中，"
+            "用于解释为什么不同空间条件会引导不同的路径选择。\n\n"
+            "从写作角度看，这些材料可以支撑论文中关于路径选择机制、环境因素和行为模拟参数设定的论述。"
+        )
 
 
 if __name__ == "__main__":
